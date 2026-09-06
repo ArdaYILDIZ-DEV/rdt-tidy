@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""rdt-tidy: token-efficient wrapper around rdt-cli.
+
+Usage:
+    rdt-tidy <command> [options]            passthrough (untouched output)
+    rdt-tidy --compact <command> [options]  compact mode (short lines)
+    rdt-tidy -c ...                         alias for --compact
+
+Passthrough never touches output or exit codes. Field filtering applies
+only in compact mode. Errors mirror the backend; nothing is invented.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from functools import partial
+from typing import Callable, NoReturn
+
+# Compact mode limits (contract: fields are dropped, text is never cut).
+LIST_DEFAULT_N = 5
+LIST_CAP_N = 10
+SUBS_CAP_N = 5
+SUBS_CAP_SUBS = 5
+EXPORT_CAP_N = 50
+
+# Compact table headers (contract).
+LISTING_HEADER = "no | score | sub | title | author | id"
+LISTING_HEADER_NO_SUB = "no | score | title | author | id"
+UCOMMENTS_HEADER = "no | author | score | sub | body | id"
+MIXED_HEADER = "kind | no | score | sub | title/body | author | id"
+EXPORT_HEADER = "score | sub | title | author | url"
+
+# Backend and exit-code contract.
+BACKEND_TIMEOUT = 30
+EX_OK = 0
+EX_BACKEND = 1  # backend failure (ERR ... on stdout)
+EX_USAGE = 2  # usage error (unknown command, export without -o)
+EX_NOT_FOUND = 127  # rdt binary not found
+JSON_FLAG = "--json"
+
+LIST_CMDS = {"feed", "popular", "all", "sub", "user-posts", "search"}
+COMMENT_LIST_CMDS = {"user-comments"}
+MIXED_CMDS = {"saved", "upvoted"}
+DETAIL_CMDS = {"read", "show"}
+PASS_CMDS = {
+    "status", "open", "upvote", "save", "subscribe", "comment",
+    "login", "logout",
+}
+KNOWN_CMDS = (
+    LIST_CMDS | COMMENT_LIST_CMDS | MIXED_CMDS | DETAIL_CMDS
+    | {"sub-info", "user", "whoami", "export"} | PASS_CMDS
+)
+
+HELP = """\
+rdt-tidy: token-efficient wrapper around rdt-cli.
+
+Usage:
+  rdt-tidy <command> [options]              passthrough, forwarded to rdt as-is
+  rdt-tidy --compact <command> [options]    compact mode, short lines
+  rdt-tidy -c <command> [options]           same as --compact
+
+  The mode flag comes BEFORE the command. A -c/--compact after the
+  command belongs to rdt itself and is forwarded untouched.
+
+Commands are the same as rdt: feed popular all sub sub-info user user-posts
+user-comments saved upvoted search export read show open upvote save
+subscribe comment status whoami login logout.
+
+Compact mode rules (summary):
+  listings are tables: header line + '|' separated rows
+    (no | score | sub | title | author | id; sub command has no sub column)
+  user-comments: no | author | score | sub | body | id
+  saved/upvoted: first column is kind (P post / C comment)
+  read/show: header line, LINK (if external), body (line breaks kept),
+    ---, all comments; replies indented by two spaces
+  table cells are single-line; a literal '|' inside a cell is data
+  sub-info: 3 lines (subscribers/online, date, full description)
+  user/whoami: single line (+ session line for whoami)
+  trailing: next <cursor> (if any). error: ERR <code>: <message>
+  listing default n=5, cap n=10. feed --subs-only cap 5x5.
+  export --compact needs a file (-o), never prints to stdout.
+"""
+
+
+# Helpers.
+
+
+def find_rdt() -> str:
+    found = shutil.which("rdt")
+    if found:
+        return found
+    cand = os.path.expanduser("~/.local/bin/rdt")
+    if os.path.exists(cand):
+        return cand
+    return "rdt"
+
+
+def squish(text: object) -> str:
+    return " ".join(str(text).split())
+
+
+def flow(text: object) -> str:
+    """Collapse inline whitespace, keep line breaks and paragraphs."""
+    out: list[str] = []
+    for line in str(text).splitlines():
+        squeezed = " ".join(line.split())
+        if squeezed:
+            out.append(squeezed)
+        elif out and out[-1]:
+            out.append("")
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
+
+
+def fmt_date(ts: object) -> str:
+    try:
+        num = float(ts)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "-"
+    if not num:
+        return "-"
+    return datetime.fromtimestamp(num, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def err_exit(msg: str, code: int = EX_BACKEND) -> NoReturn:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+# Position-aware option parsing. Tokens starting with `-` are flags
+# (click-compatible); the rest is positional. Tidy flags (-c/--compact)
+# apply only before the command; anything after `--` stays positional.
+
+VALUE_OPTS = {
+    "-n", "--limit", "--max-subs", "--after", "-s", "--sort",
+    "-t", "--time", "-r", "--subreddit", "-o", "--output",
+    "--format", "--count",
+}
+
+TIDY_FLAGS = {"-c", "--compact"}
+
+
+def _classify(tokens: list[str]) -> list[str]:
+    """Classify each token as flag (f), value (v), or positional (p)."""
+    kinds: list[str] = []
+    expect_val = False
+    dashdash = False
+    for t in tokens:
+        if expect_val:
+            kinds.append("v")
+            expect_val = False
+            continue
+        if dashdash:
+            kinds.append("p")
+            continue
+        if t == "--":
+            kinds.append("f")
+            dashdash = True
+            continue
+        if t.startswith("--") and "=" in t:
+            kinds.append("f")
+            continue
+        if len(t) > 1 and t.startswith("-") and not t[1:].lstrip("-").replace(".", "", 1).isdigit():
+            kinds.append("f")
+            if t.split("=", 1)[0] in VALUE_OPTS:
+                expect_val = True
+            continue
+        kinds.append("p")
+    return kinds
+
+
+def _is_packed_short(token: str, names: set[str]) -> bool:
+    """Match packed short form (`-n50`): short flag prefix plus number."""
+    if token.startswith("--") or len(token) <= 2 or token[:2] not in names:
+        return False
+    try:
+        int(token[2:].lstrip("="))
+    except ValueError:
+        return False
+    return True
+
+
+class TokenView:
+    """Token list with a single classification pass.
+
+    The grammar lives in `_classify`; scanning runs once in `__init__`.
+    Mutations keep `kinds` in sync, so no rescan is needed. Methods
+    are chainable (return self).
+    """
+
+    __slots__ = ("tokens", "kinds")
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.tokens = list(tokens)
+        self.kinds = _classify(self.tokens)
+
+    def indices(self, names: set[str]) -> list[int]:
+        """Indices of matching flags (packed short forms included)."""
+        idx: list[int] = []
+        for i, (t, k) in enumerate(zip(self.tokens, self.kinds)):
+            if k != "f":
+                continue
+            head = t.split("=", 1)[0] if t.startswith("--") else t
+            if head in names:
+                idx.append(i)
+            elif _is_packed_short(t, names):
+                idx.append(i)
+        return idx
+
+    def has(self, names: set[str]) -> bool:
+        return bool(self.indices(names))
+
+    def value(self, names: set[str]) -> str | None:
+        for i in self.indices(names):
+            t = self.tokens[i]
+            if t.startswith("--") and "=" in t:
+                return t.split("=", 1)[1]
+            if not t.startswith("--") and len(t) > 2:
+                return t[2:].lstrip("=")
+            if i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
+                return self.tokens[i + 1]
+        return None
+
+    def cap(self, names: set[str], cap: int) -> TokenView:
+        """Clamp option values to the cap; kinds are unchanged."""
+        for i in self.indices(names):
+            t = self.tokens[i]
+            if t.startswith("--") and "=" in t:
+                name, _, val = t.partition("=")
+                try:
+                    if int(val) > cap:
+                        self.tokens[i] = f"{name}={cap}"
+                except ValueError:
+                    pass
+            elif not t.startswith("--") and len(t) > 2 and t[:2] in names:
+                try:
+                    if int(t[2:].lstrip("=")) > cap:
+                        self.tokens[i] = t[:2] + str(cap)
+                except ValueError:
+                    pass
+            elif i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
+                try:
+                    if int(self.tokens[i + 1]) > cap:
+                        self.tokens[i + 1] = str(cap)
+                except ValueError:
+                    pass
+        return self
+
+    def ensure(self, flag: str, value: str, names: set[str]) -> TokenView:
+        """Append the default option when none is present."""
+        if not self.indices(names):
+            self.tokens += [flag, value]
+            self.kinds += ["f", "v"]
+        return self
+
+    def add_bare(self, flag: str) -> TokenView:
+        """Append a valueless flag (e.g. --json)."""
+        self.tokens.append(flag)
+        self.kinds.append("f")
+        return self
+
+    def drop(self, names: set[str]) -> TokenView:
+        """Drop bare flags (rdt -c/--compact, --yaml)."""
+        kept = [(t, k) for t, k in zip(self.tokens, self.kinds)
+                if not (k == "f" and t in names)]
+        if len(kept) != len(self.tokens):
+            self.tokens = [t for t, _ in kept]
+            self.kinds = [k for _, k in kept]
+        return self
+
+
+# Backend invocation.
+
+
+def run_backend(args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [find_rdt()] + args,
+            capture_output=True, text=True, timeout=BACKEND_TIMEOUT,
+        )
+    except FileNotFoundError:
+        err_exit("ERR not-found: rdt binary not found (not on PATH)", EX_NOT_FOUND)
+    except subprocess.TimeoutExpired:
+        err_exit("ERR timeout: rdt did not respond within 30s", EX_BACKEND)
+
+
+def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
+    if not proc.stdout.strip():
+        detail = squish(proc.stderr) or "empty output"
+        print(f"ERR backend: {detail}")
+        raise SystemExit(proc.returncode or EX_BACKEND)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        # Not JSON: pass through untouched to avoid data loss.
+        sys.stdout.write(proc.stdout)
+        raise SystemExit(proc.returncode)
+
+
+def check_error(env: object) -> None:
+    if isinstance(env, dict) and not env.get("ok", True):
+        info = env.get("error", {}) if isinstance(env.get("error"), dict) else {}
+        code = info.get("code", "backend") if isinstance(info, dict) else "backend"
+        msg = info.get("message", "hata") if isinstance(info, dict) else "hata"
+        print(f"ERR {code}: {squish(msg)}")
+        raise SystemExit(EX_BACKEND)
+
+
+# List rendering.
+
+
+def _child_kind_body(child: object) -> tuple[str, dict]:
+    if isinstance(child, dict):
+        data = child.get("data", child)
+        kind = str(child.get("kind", "t3"))
+        return kind, data if isinstance(data, dict) else {}
+    return "t3", {}
+
+
+def _inum(value: object) -> int:
+    try:
+        return int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _signed(value: object) -> str:
+    return f"{_inum(value):+d}"
+
+
+def _post_cells(num: int, d: dict, show_sub: bool) -> list[str]:
+    cells = [str(num), f"{_signed(d.get('score', 0))}c{_inum(d.get('num_comments', 0))}"]
+    if show_sub and d.get("subreddit"):
+        cells.append(f"r/{d['subreddit']}")
+    title = squish(d.get("title", "-") or "-")
+    author = d.get("author", "?") or "?"
+    cells += [title, f"u/{author}", f"{d.get('id', '')}"]
+    return cells
+
+
+def post_line(num: int, d: dict, show_sub: bool) -> str:
+    return " | ".join(_post_cells(num, d, show_sub))
+
+
+def _comment_cells(num: int, d: dict) -> list[str]:
+    return [
+        str(num),
+        f"u/{d.get('author', '?')}",
+        _signed(d.get("score", 0)),
+        f"r/{d.get('subreddit', '?')}",
+        squish(d.get("body", "")),
+        f"{d.get('id', '')}",
+    ]
+
+
+def comment_line(num: int, d: dict) -> str:
+    return " | ".join(_comment_cells(num, d))
+
+
+def _listing_children(env: object) -> tuple[list[tuple[str, dict]], object]:
+    """Unwrap a listing envelope into (kind, data) items plus cursor."""
+    data = env["data"] if isinstance(env, dict) else {}
+    inner = data.get("data", data) if isinstance(data, dict) else {}
+    children = inner.get("children", []) if isinstance(inner, dict) else []
+    after = inner.get("after") if isinstance(inner, dict) else None
+    items = []
+    for child in children:
+        kind, d = _child_kind_body(child)
+        if d.get("id"):
+            items.append((kind, d))
+    return items, after
+
+
+def _render_table(env: object, header: str, show_sub: bool) -> str:
+    items, after = _listing_children(env)
+    lines = [header]
+    for num, (kind, d) in enumerate(items, 1):
+        if kind == "t1":
+            lines.append(comment_line(num, d))
+        else:
+            lines.append(post_line(num, d, show_sub))
+    if after:
+        lines.append(f"next {after}")
+    return "\n".join(lines)
+
+
+def render_listing(env: object, show_sub: bool) -> str:
+    header = LISTING_HEADER if show_sub else LISTING_HEADER_NO_SUB
+    return _render_table(env, header, show_sub)
+
+
+def render_comment_list(env: object) -> str:
+    return _render_table(env, UCOMMENTS_HEADER, show_sub=True)
+
+
+def render_mixed(env: object) -> str:
+    items, after = _listing_children(env)
+    lines = [MIXED_HEADER]
+    for num, (kind, d) in enumerate(items, 1):
+        if kind == "t1":
+            cnum, author, score, sub, body, cid = _comment_cells(num, d)
+            lines.append(" | ".join(["C", cnum, score, sub, body, author, cid]))
+        else:
+            lines.append(" | ".join(["P", *_post_cells(num, d, show_sub=True)]))
+    if after:
+        lines.append(f"next {after}")
+    return "\n".join(lines)
+
+
+# Detail rendering (read/show).
+
+
+def _typed_replies(node: dict) -> list[dict]:
+    out: list[dict] = []
+    for rep in node.get("replies", []) or []:
+        if isinstance(rep, dict):
+            out.append({
+                "author": rep.get("author", "?"),
+                "body": rep.get("body", ""),
+                "score": rep.get("score", 0),
+                "depth": 1,
+            })
+    return out
+
+
+def _raw_comment_of(d: dict, depth: int = 0) -> dict:
+    """Reduce raw t1 data to a compact comment (0 top-level, 1 reply)."""
+    return {
+        "author": d.get("author", "?"),
+        "body": d.get("body", ""),
+        "score": d.get("score", 0),
+        "depth": depth,
+    }
+
+
+def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> int:
+    """Fold one raw child: append t1 comments, count hidden `more` items."""
+    if not isinstance(child, dict):
+        return 0
+    if child.get("kind") == "more":
+        return len(child.get("data", {}).get("children", []) or [])
+    if child.get("kind") != "t1":
+        return 0
+    d = child.get("data", {})
+    if not isinstance(d, dict):
+        return 0
+    comments.append(_raw_comment_of(d, depth))
+    return 0
+
+
+def parse_detail(data: object) -> tuple[dict, list[dict], int]:
+    """Return (post, flat comment list, hidden `more` count)."""
+    if isinstance(data, dict):
+        post = data.get("post", {}) if isinstance(data.get("post"), dict) else {}
+        comments: list[dict] = []
+        for node in data.get("comments", []) or []:
+            if not isinstance(node, dict):
+                continue
+            comments.append({**node, "depth": 0})
+            comments.extend(_typed_replies(node))
+        return post, comments, int(data.get("more_count", 0) or 0)
+
+    if isinstance(data, list) and data:
+        post: dict = {}
+        first = data[0] if isinstance(data[0], dict) else {}
+        kids = first.get("data", {}).get("children", []) if isinstance(first, dict) else []
+        if kids and isinstance(kids[0], dict):
+            inner = kids[0].get("data", {})
+            post = inner if isinstance(inner, dict) else {}
+        comments: list[dict] = []
+        more = 0
+        second = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
+        for child in second.get("data", {}).get("children", []) or []:
+            more += _absorb_raw_child(child, comments)
+            if not (isinstance(child, dict) and child.get("kind") == "t1"):
+                continue
+            d = child.get("data", {})
+            if not (isinstance(d, dict) and isinstance(d.get("replies", {}), dict)):
+                continue
+            for rchild in d["replies"].get("data", {}).get("children", []) or []:
+                more += _absorb_raw_child(rchild, comments, depth=1)
+        return post, comments, more
+    return {}, [], 0
+
+
+def render_detail(env: object) -> str:
+    data = env["data"] if isinstance(env, dict) else {}
+    post, comments, more = parse_detail(data)
+    pid = post.get("id", "?")
+    lines = [
+        f"# {pid} r/{post.get('subreddit', '?')} | {squish(post.get('title', '-') or '-')} "
+        f"| u/{post.get('author', '?')} {_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c)"
+    ]
+    url = str(post.get("url", "") or "")
+    if url and not post.get("is_self", True):
+        lines.append(f"LINK {url}")
+    body = flow(post.get("selftext", "") or "")
+    if body:
+        lines.append(body)
+    if comments:
+        lines.append("---")
+        for c in comments:
+            text = f"u/{c.get('author', '?')} {_signed(c.get('score', 0))}: {flow(c.get('body', ''))}"
+            if c.get("depth", 0):
+                lines.extend(f"  {ln}" if ln else ln for ln in text.splitlines())
+            else:
+                lines.append(text)
+    if more:
+        lines.append(f"+{more} more")
+    return "\n".join(lines)
+
+
+# Info rendering.
+
+
+def render_subinfo(env: object) -> str:
+    data = env["data"] if isinstance(env, dict) else {}
+    if not isinstance(data, dict):
+        return ""
+    name = data.get("display_name_prefixed") or f"r/{data.get('display_name', '?')}"
+    lines = [
+        f"{name} {data.get('subscribers', 0)} subs {data.get('accounts_active', 0)} online",
+        f"created {fmt_date(data.get('created_utc', 0))}"
+        + (" NSFW" if data.get("over18") else ""),
+    ]
+    desc = squish(data.get("public_description", "") or "")
+    if desc:
+        lines.append(desc)
+    return "\n".join(lines)
+
+
+def render_user(env: object) -> str:
+    data = env["data"] if isinstance(env, dict) else {}
+    if not isinstance(data, dict):
+        return ""
+    return (
+        f"u/{data.get('name', '?')} post:{data.get('link_karma', 0)} "
+        f"comment:{data.get('comment_karma', 0)} age:{fmt_date(data.get('created_utc', 0))}"
+    )
+
+
+def render_whoami(env: object) -> str:
+    first = render_user(env)
+    data = env["data"] if isinstance(env, dict) else {}
+    sess = data.get("_session", {}) if isinstance(data, dict) else {}
+    if isinstance(sess, dict) and sess:
+        caps = ",".join(sess.get("capabilities", []) or []) or "-"
+        mod = 1 if sess.get("modhash_present") else 0
+        return f"{first}\nsess {caps} modhash:{mod}"
+    return first
+
+
+# Compact commands.
+
+
+def backend_args(view: TokenView) -> list[str]:
+    """Build the backend call: force raw JSON, keep positionals intact."""
+    view.drop(TIDY_FLAGS | {"--yaml"})
+    if not view.has({"--json"}):
+        view.add_bare(JSON_FLAG)
+    return view.tokens
+
+
+INFO_RENDERERS: dict[str, Callable[[object], str]] = {
+    "sub-info": render_subinfo,
+    "user": render_user,
+    "whoami": render_whoami,
+}
+
+
+def _compact_list_view(cmd: str, rest: list[str]) -> TokenView:
+    """Shared limit policy for listing commands (clamp plus default)."""
+    view = TokenView(rest)
+    view.cap({"-n", "--limit"}, LIST_CAP_N)
+    if cmd == "feed" and "--subs-only" in view.tokens:
+        view.cap({"--max-subs"}, SUBS_CAP_SUBS)
+        view.cap({"-n", "--limit"}, SUBS_CAP_N)
+        view.ensure("--max-subs", str(SUBS_CAP_SUBS), {"--max-subs"})
+    view.ensure("-n", str(LIST_DEFAULT_N), {"-n", "--limit"})
+    return view
+
+
+def _run_compact(cmd: str, view: TokenView, render: Callable[[object], str]) -> int:
+    """Shared compact pipeline: backend, envelope, error check, render."""
+    proc = run_backend([cmd] + backend_args(view))
+    env = load_envelope(proc)
+    check_error(env)
+    assert isinstance(env, dict)
+    print(render(env))
+    return EX_OK
+
+
+def cmd_listing(cmd: str, rest: list[str]) -> int:
+    view = _compact_list_view(cmd, rest)
+    if view.has({"-o", "--output"}):
+        # File output: let rdt write it so stdout stays clean.
+        return cmd_passthrough(cmd, view.tokens)
+    show_sub = cmd != "sub"
+    return _run_compact(cmd, view, partial(render_listing, show_sub=show_sub))
+
+
+def cmd_comment_list(cmd: str, rest: list[str]) -> int:
+    view = _compact_list_view(cmd, rest)
+    return _run_compact(cmd, view, render_comment_list)
+
+
+def cmd_mixed(cmd: str, rest: list[str]) -> int:
+    view = _compact_list_view(cmd, rest)
+    return _run_compact(cmd, view, render_mixed)
+
+
+def cmd_detail(cmd: str, rest: list[str]) -> int:
+    return _run_compact(cmd, TokenView(rest), render_detail)
+
+
+def _strip_format_opt(tokens: list[str]) -> list[str]:
+    """Drop --format in both spellings (--format csv, --format=csv)."""
+    cleaned: list[str] = []
+    skip_next = False
+    for t in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        base = t.split("=", 1)[0] if t.startswith("--") else t
+        if base == "--format":
+            if "=" not in t:
+                skip_next = True
+            continue
+        cleaned.append(t)
+    return cleaned
+
+
+def _export_line(row: dict) -> str:
+    """Convert a CSV row into a short export line."""
+    return " | ".join([
+        f"{_signed(_inum(row.get('score', 0)))}c{_inum(row.get('num_comments', 0))}",
+        f"r/{row.get('subreddit', '?')}",
+        squish(row.get("title", "")),
+        f"u/{row.get('author', '?')}",
+        f"{row.get('url', '')}",
+    ])
+
+
+def cmd_export_compact(rest: list[str]) -> int:
+    view = TokenView(rest)
+    outfile = view.value({"-o", "--output"})
+    if not outfile:
+        print("ERR usage: export --compact requires a file (-o FILE)", file=sys.stderr)
+        return EX_USAGE
+    view.cap({"-n", "--count"}, EXPORT_CAP_N)
+    # Readable CSV as the intermediate format, then shrink to short lines.
+    cleaned = _strip_format_opt(view.tokens) + ["--format", "csv"]
+    proc = run_backend(["export"] + cleaned)
+    if proc.returncode != 0:
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+    try:
+        with open(outfile, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError as exc:
+        print(f"ERR io: cannot read {outfile}: {exc}", file=sys.stderr)
+        return EX_BACKEND
+    body = [_export_line(r) for r in rows[:EXPORT_CAP_N]]
+    lines = [EXPORT_HEADER, *body] if body else []
+    try:
+        with open(outfile, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+    except OSError as exc:
+        print(f"ERR io: cannot write {outfile}: {exc}", file=sys.stderr)
+        return EX_BACKEND
+    print(f"saved {outfile} ({len(body)} rows)")
+    return EX_OK
+
+
+def cmd_passthrough(cmd: str, rest: list[str]) -> int:
+    proc = run_backend([cmd] + rest)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+# Entry point.
+
+
+def main(argv: list[str]) -> int:
+    # Mode flags are recognized only before the command; later -c/--compact
+    # belongs to rdt and positional text is left alone.
+    compact = False
+    rest = list(argv)
+    while rest and rest[0] in TIDY_FLAGS:
+        compact = True
+        rest = rest[1:]
+
+    if not rest or rest[0] in ("-h", "--help"):
+        print(HELP)
+        return EX_OK
+    cmd, args = rest[0], rest[1:]
+    if "--help" in args or "-h" in args:
+        proc = run_backend([cmd] + args)
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+    if cmd not in KNOWN_CMDS:
+        if compact:
+            print(f"ERR usage: unknown command: {cmd}", file=sys.stderr)
+            return EX_USAGE
+        proc = run_backend([cmd] + args)
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+    if not compact:
+        proc = run_backend([cmd] + args)
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+
+    # Compact dispatch.
+    if cmd in LIST_CMDS:
+        return cmd_listing(cmd, args)
+    if cmd in COMMENT_LIST_CMDS:
+        return cmd_comment_list(cmd, args)
+    if cmd in MIXED_CMDS:
+        return cmd_mixed(cmd, args)
+    if cmd in DETAIL_CMDS:
+        return cmd_detail(cmd, args)
+    if cmd in INFO_RENDERERS:
+        return _run_compact(cmd, TokenView(args), INFO_RENDERERS[cmd])
+    if cmd == "export":
+        return cmd_export_compact(args)
+    return cmd_passthrough(cmd, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
