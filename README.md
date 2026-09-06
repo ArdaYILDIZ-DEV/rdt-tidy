@@ -79,6 +79,17 @@ ln -s "$PWD/rdt-tidy" ~/.local/bin/rdt-tidy
 rdt-tidy --compact sub python
 ```
 
+## Use as AI agent skill
+
+Agents get the full contract from [SKILL.md](./SKILL.md): compact tables, thread format, paging, and error recovery. Copy it into your harness's skill folder (run from the repo root):
+
+```sh
+mkdir -p {skill-dir}/rdt-tidy
+cp SKILL.md {skill-dir}/rdt-tidy/SKILL.md
+```
+
+Replace `{skill-dir}` with your harness's skill folder location, e.g. `.agents/skills` (Skills CLI layout) or `~/.pi/agent/skills` (Pi agent).
+
 ## Usage
 
 ```sh
@@ -200,15 +211,6 @@ status   →  passed through
 5. Records render into the matching format per command type and write to stdout.
 
 Empty backend output never loses data; `ERR backend: ...` prints and the process exits 1. When stdout is not JSON it passes through as-is.
-
-## Use as AI agent skill
-
-Agents get the full contract from [SKILL.md](./SKILL.md): compact tables, thread format, paging, and error recovery. Install it into any agent checkout (run from the repo root):
-
-```sh
-mkdir -p .agents/skills/rdt-tidy
-cp SKILL.md .agents/skills/rdt-tidy/SKILL.md
-```
 
 ## Data files
 
