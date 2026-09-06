@@ -201,6 +201,15 @@ status   →  passed through
 
 Empty backend output never loses data; `ERR backend: ...` prints and the process exits 1. When stdout is not JSON it passes through as-is.
 
+## Use as AI agent skill
+
+Agents get the full contract from [SKILL.md](./SKILL.md): compact tables, thread format, paging, and error recovery. Install it into any agent checkout (run from the repo root):
+
+```sh
+mkdir -p .agents/skills/rdt-tidy
+cp SKILL.md .agents/skills/rdt-tidy/SKILL.md
+```
+
 ## Data files
 
 rdt-tidy creates no config file and stores no credentials. It reuses rdt-cli's files under `~/.config/rdt-cli/` as-is (`credential.json` for cookies, `index_cache.json` for short-index navigation). The only write path is the export file given via `-o`; an existing file is silently overwritten.
