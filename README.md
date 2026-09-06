@@ -14,6 +14,17 @@ rdt-tidy --compact sub python
 rdt-tidy -c search "rust vs go" -n 8
 ```
 
+## Use as an AI agent skill
+
+Agents get the full contract from [SKILL.md](./SKILL.md): compact tables, thread format, paging, and error recovery. Copy it into your harness's skill folder, run from the repo root:
+
+```sh
+mkdir -p {skill-dir}/rdt-tidy
+cp SKILL.md {skill-dir}/rdt-tidy/SKILL.md
+```
+
+Replace `{skill-dir}` with your harness's skill folder location, for example `.agents/skills` (Skills CLI layout) or `~/.pi/agent/skills` (Pi agent).
+
 ## Features
 
 - Passthrough output is byte-identical in normal mode; exit code is preserved.
@@ -230,17 +241,6 @@ status   →  passed through
 ## Data files
 
 rdt-tidy creates no config file of its own and stores no credentials. It reuses rdt-cli's files under `~/.config/rdt-cli/` as-is (`credential.json` for cookies, `index_cache.json` for short-index navigation). The only write path is the export file given via `-o`; an existing file is silently overwritten.
-
-## Use as an AI agent skill
-
-Agents get the full contract from [SKILL.md](./SKILL.md): compact tables, thread format, paging, and error recovery. Copy it into your harness's skill folder, run from the repo root:
-
-```sh
-mkdir -p {skill-dir}/rdt-tidy
-cp SKILL.md {skill-dir}/rdt-tidy/SKILL.md
-```
-
-Replace `{skill-dir}` with your harness's skill folder location, for example `.agents/skills` (Skills CLI layout) or `~/.pi/agent/skills` (Pi agent).
 
 ## Project structure
 
