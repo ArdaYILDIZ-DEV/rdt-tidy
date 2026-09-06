@@ -1,18 +1,16 @@
-**Single-file wrapper that shrinks rdt-cli output into model-friendly lines.**
+<p align="center">
+  <strong>Single-file wrapper that shrinks rdt-cli output into model-friendly lines.</strong><br>
+  <a href="https://pypi.org/project/rdt-cli/"><img src="https://img.shields.io/pypi/v/rdt-cli.svg?style=flat-square" alt="rdt-cli on PyPI"></a>
+  <img src="https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/deps-stdlib%20only-green?style=flat-square" alt="stdlib only">
+</p>
 
-rdt-tidy runs the `rdt` binary as a subprocess. Without flags it passes output through untouched. In `--compact` mode it converts the raw JSON response into short positional lines. It has no dependencies, uses only the standard library, and never touches credentials or caches.
+rdt-tidy runs the `rdt` binary as a subprocess. Without flags it passes output through untouched. In `--compact` mode it converts the raw JSON response into short positional lines, cutting token cost 27-38x on live data. It has no dependencies, uses only the standard library, and never touches credentials or caches.
 
 ## Quick start
 
 ```sh
-chmod +x rdt-tidy
-./rdt-tidy --compact sub python
-```
-
-To use via PATH:
-
-```sh
-ln -s "$PWD/rdt-tidy" ~/.local/bin/rdt-tidy
+rdt-tidy --compact sub python
 rdt-tidy -c search "rust vs go" -n 8
 ```
 
@@ -28,11 +26,58 @@ rdt-tidy -c search "rust vs go" -n 8
 ## Requirements
 
 - Python 3.8+ (verified on 3.13.5).
-- A working `rdt` install on PATH or under `~/.local/bin/`.
+- A working `rdt` install (see below) on PATH or under `~/.local/bin/`.
+- `uv` or `pipx` for installing rdt-cli.
 
 ## Installation
 
-No build step. The file just needs to be executable. Move the single file to any directory by copying it.
+### 1. Install rdt-cli
+
+Recommended: uv tool (fast, isolated):
+
+```sh
+uv tool install rdt-cli
+```
+
+Or pipx:
+
+```sh
+pipx install rdt-cli
+```
+
+Upgrade to the latest version:
+
+```sh
+uv tool upgrade rdt-cli
+# or: pipx upgrade rdt-cli
+```
+
+From source (upstream: `github.com/jackwener/rdt-cli`, requires Python 3.10+):
+
+```sh
+git clone git@github.com:jackwener/rdt-cli.git
+cd rdt-cli
+uv sync
+uv run rdt status   # run from the clone without installing
+```
+
+Verify:
+
+```sh
+rdt status
+```
+
+Anonymous browsing works without login. Commands that need an account (`feed`, `saved`, voting) require `rdt login` first, which extracts browser cookies.
+
+### 2. Install rdt-tidy
+
+No build step. The file just needs to be executable:
+
+```sh
+chmod +x rdt-tidy
+ln -s "$PWD/rdt-tidy" ~/.local/bin/rdt-tidy
+rdt-tidy --compact sub python
+```
 
 ## Usage
 
@@ -158,7 +203,7 @@ Empty backend output never loses data; `ERR backend: ...` prints and the process
 
 ## Data files
 
-rdt-tidy creates no config file and stores no credentials. rdt-cli's files under `~/.config/rdt-cli/` are used as-is. The only write path is the export file given via `-o`; an existing file is silently overwritten.
+rdt-tidy creates no config file and stores no credentials. It reuses rdt-cli's files under `~/.config/rdt-cli/` as-is (`credential.json` for cookies, `index_cache.json` for short-index navigation). The only write path is the export file given via `-o`; an existing file is silently overwritten.
 
 ## Project layout
 
@@ -218,3 +263,7 @@ The backend did not return in 30 seconds. Check the network connection and retry
 ## Contributing
 
 Scope is behavior-preserving changes only. Every change needs tests; when the suite is red, fix the code, never loosen the test. New compact format proposals start as a contract discussion.
+
+## License
+
+Apache-2.0, see [LICENSE](./LICENSE).
