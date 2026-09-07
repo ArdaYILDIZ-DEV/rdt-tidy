@@ -596,7 +596,7 @@ def _compact_list_view(cmd: str, rest: list[str]) -> TokenView:
     """Shared limit policy for listing commands (clamp plus default)."""
     view = TokenView(rest)
     view.cap({"-n", "--limit"}, LIST_CAP_N)
-    if cmd == "feed" and "--subs-only" in view.tokens:
+    if cmd == "feed" and view.has({"--subs-only"}):
         view.cap({"--max-subs"}, SUBS_CAP_SUBS)
         view.cap({"-n", "--limit"}, SUBS_CAP_N)
         view.ensure("--max-subs", str(SUBS_CAP_SUBS), {"--max-subs"})
