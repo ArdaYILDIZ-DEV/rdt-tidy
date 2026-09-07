@@ -475,9 +475,10 @@ def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> in
 
 def parse_detail(data: object) -> tuple[dict, list[dict], int]:
     """Return (post, flat comment list, hidden `more` count)."""
+    post: dict = {}
+    comments: list[dict] = []
     if isinstance(data, dict):
         post = data.get("post", {}) if isinstance(data.get("post"), dict) else {}
-        comments: list[dict] = []
         for node in data.get("comments", []) or []:
             if not isinstance(node, dict):
                 continue
@@ -486,13 +487,11 @@ def parse_detail(data: object) -> tuple[dict, list[dict], int]:
         return post, comments, int(data.get("more_count", 0) or 0)
 
     if isinstance(data, list) and data:
-        post: dict = {}
         first = data[0] if isinstance(data[0], dict) else {}
         kids = first.get("data", {}).get("children", []) if isinstance(first, dict) else []
         if kids and isinstance(kids[0], dict):
             inner = kids[0].get("data", {})
             post = inner if isinstance(inner, dict) else {}
-        comments: list[dict] = []
         more = 0
         second = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
         for child in second.get("data", {}).get("children", []) or []:
