@@ -615,10 +615,12 @@ def _run_compact(cmd: str, view: TokenView, render: Callable[[object], str]) -> 
 
 
 def cmd_listing(cmd: str, rest: list[str]) -> int:
-    view = _compact_list_view(cmd, rest)
-    if view.has({"-o", "--output"}):
+    if TokenView(rest).has({"-o", "--output"}):
         # File output: let rdt write it so stdout stays clean.
-        return cmd_passthrough(cmd, view.tokens)
+        # Check the original args before compact clamping so -n 50/100
+        # to a file is forwarded untouched, not truncated to the cap.
+        return cmd_passthrough(cmd, rest)
+    view = _compact_list_view(cmd, rest)
     show_sub = cmd != "sub"
     return _run_compact(cmd, view, partial(render_listing, show_sub=show_sub))
 
