@@ -681,6 +681,11 @@ def cmd_export_compact(rest: list[str]) -> int:
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)
         return proc.returncode
+    if not os.path.isfile(outfile):
+        # Backend succeeded but produced no file (stdout used or flag
+        # ignored): backend discrepancy, not a local disk failure.
+        print(f"ERR backend: export did not write {outfile}", file=sys.stderr)
+        return EX_BACKEND
     try:
         with open(outfile, encoding="utf-8-sig", newline="") as f:
             rows = list(csv.DictReader(f))
