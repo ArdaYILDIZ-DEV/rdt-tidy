@@ -326,7 +326,7 @@ def check_error(env: object) -> None:
     if isinstance(env, dict) and not env.get("ok", True):
         info = env.get("error", {}) if isinstance(env.get("error"), dict) else {}
         code = info.get("code", "backend") if isinstance(info, dict) else "backend"
-        msg = info.get("message", "hata") if isinstance(info, dict) else "hata"
+        msg = info.get("message", "unknown error") if isinstance(info, dict) else "unknown error"
         print(f"ERR {code}: {squish(msg)}")
         raise SystemExit(EX_BACKEND)
 
