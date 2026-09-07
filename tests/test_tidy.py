@@ -229,7 +229,7 @@ with tempfile.TemporaryDirectory() as tmp:
     run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
         "-c", "search", "--", "-c")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("-- after -c preserved", argv == ["search", "--", "-c", "-n", "5", "--json"],
+    check("-- after -c preserved", argv == ["search", "-n", "5", "--json", "--", "-c"],
           repr(argv))
 
     # 22. File output preserves the raw limit (no compact clamp to 10)
@@ -270,9 +270,87 @@ with tempfile.TemporaryDirectory() as tmp:
             "--compact", "search", "--", "-h")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
     check("dashdash -h stays compact",
-          argv == ["search", "--", "-h", "-n", "5", "--json"], repr(argv))
+          argv == ["search", "-n", "5", "--json", "--", "-h"], repr(argv))
     check("dashdash -h renders table",
           p.stdout.splitlines()[0] == "no | score | sub | title | author | id",
           repr(p.stdout[:80]))
+
+    # 26. Empty envelope {"ok": true} renders header only, no KeyError
+    empty_env = os.path.join(tmp, "empty_env.json")
+    open(empty_env, "w", encoding="utf-8").write('{"ok": true}')
+    p = run({"RDT_FIXTURE": empty_env}, "--compact", "search", "x")
+    check("empty envelope exit0", p.returncode == 0, repr((p.returncode, p.stderr)))
+    check("empty envelope header only",
+          p.stdout.strip() == "no | score | sub | title | author | id", repr(p.stdout))
+
+    # 27. Null data node does not raise AttributeError
+    null_env = os.path.join(tmp, "null_data.json")
+    open(null_env, "w", encoding="utf-8").write('{"ok": true, "data": null}')
+    p = run({"RDT_FIXTURE": null_env}, "--compact", "search", "x")
+    check("null data exit0", p.returncode == 0, repr((p.returncode, p.stderr)))
+    check("null data header", "no | score" in p.stdout, repr(p.stdout))
+
+    # 28. Non-dict envelope -> controlled ERR, not AssertionError
+    arr_env = os.path.join(tmp, "arr.json")
+    open(arr_env, "w", encoding="utf-8").write('[]')
+    p = run({"RDT_FIXTURE": arr_env}, "--compact", "search", "x")
+    check("array envelope exit1", p.returncode == 1, str(p.returncode))
+    check("array envelope msg", "ERR backend: invalid envelope" in p.stdout,
+          repr((p.stdout, p.stderr)))
+    scalar_env = os.path.join(tmp, "scalar.json")
+    open(scalar_env, "w", encoding="utf-8").write('"oops"')
+    p = run({"RDT_FIXTURE": scalar_env}, "--compact", "search", "x")
+    check("scalar envelope exit1", p.returncode == 1, str(p.returncode))
+    check("scalar envelope msg", "ERR backend: invalid envelope" in p.stdout,
+          repr((p.stdout, p.stderr)))
+
+    # 29. Double dash keeps -c positional, synthesized opts precede --
+    open(log, "w").close()
+    p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+            "-c", "search", "--", "-c")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("doubledash -n/--json before --",
+          argv == ["search", "-n", "5", "--json", "--", "-c"], repr(argv))
+
+    # 30. Packed numeric flag: -n=5 leaves --subs-only as flag
+    # (covered in unit, e2e guard: backend receives intact --subs-only)
+    open(log, "w").close()
+    run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+        "--compact", "feed", "--subs-only", "-n=25")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("packed -n= clamps, subs-only intact",
+          "--subs-only" in argv and "25" not in argv, repr(argv))
+
+    # 31. Missing subreddit emits r/? with invariant column count
+    missing_sub = os.path.join(tmp, "missing_sub.json")
+    open(missing_sub, "w", encoding="utf-8").write(json.dumps({
+        "ok": True, "data": {"data": {"children": [
+            {"kind": "t3", "data": {"id": "a1", "title": "t", "author": "a",
+                                    "score": 1, "num_comments": 0}},
+        ], "after": None}}}))
+    p = run({"RDT_FIXTURE": missing_sub}, "--compact", "search", "x")
+    check("missing sub r/?", "r/?" in p.stdout, repr(p.stdout))
+    check("missing sub col count",
+          len(p.stdout.splitlines()[1].split(" | ")) == len("no | score | sub | title | author | id".split(" | ")),
+          repr(p.stdout))
+
+    # 32. Export default cap injects -n 50
+    out3 = os.path.join(tmp, "exp3.csv")
+    csv_text2 = ("title,subreddit,author,score,num_comments,url\n"
+                 "t,s,a,1,0,http://e.com\n")
+    open(log, "w").close()
+    p = run({"RDT_EXPORT_CSV": csv_text2, "RDT_ARGV_LOG": log},
+            "--compact", "export", "x", "-o", out3)
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("export default -n 50", "-n" in argv and "50" in argv, repr(argv))
+
+    # 33. Invalid JSON stdout forwards proc.stderr
+    bad_json = os.path.join(tmp, "bad.json")
+    open(bad_json, "w", encoding="utf-8").write("not-json\n")
+    p = run({"RDT_FIXTURE": bad_json, "RDT_EXIT": "1", "RDT_STDERR": "boom-stderr\n"},
+            "--compact", "search", "x")
+    check("bad json exit1", p.returncode == 1, str(p.returncode))
+    check("bad json stdout passthrough", p.stdout == "not-json\n", repr(p.stdout))
+    check("bad json stderr forwarded", "boom-stderr" in p.stderr, repr(p.stderr))
 
 print(f"\n{PASS} tests passed")

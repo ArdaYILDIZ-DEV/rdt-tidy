@@ -31,4 +31,7 @@ if argv and argv[0] == "export":
 fix = os.environ.get("RDT_FIXTURE", "")
 with open(fix, encoding="utf-8") as f:
     sys.stdout.write(f.read())
+serr = os.environ.get("RDT_STDERR", "")
+if serr:
+    sys.stderr.write(serr)
 raise SystemExit(int(os.environ.get("RDT_EXIT", "0") or 0))

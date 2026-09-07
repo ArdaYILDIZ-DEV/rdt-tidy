@@ -21,6 +21,15 @@ _looks_like_flag = _mod._looks_like_flag
 EX_BACKEND = _mod.EX_BACKEND
 parse_detail = _mod.parse_detail
 render_detail = _mod.render_detail
+_envelope_data = _mod._envelope_data
+_listing_children = _mod._listing_children
+render_listing = _mod.render_listing
+render_mixed = _mod.render_mixed
+_post_cells = _mod._post_cells
+post_line = _mod.post_line
+load_envelope = _mod.load_envelope
+LISTING_HEADER = _mod.LISTING_HEADER
+EXPORT_CAP_N = _mod.EXPORT_CAP_N
 
 
 class TokenViewTest(unittest.TestCase):
@@ -90,7 +99,7 @@ class TokenViewTest(unittest.TestCase):
     def test_backend_args_flow(self):
         self.assertEqual(
             backend_args(TokenView(["search", "--", "-c"])),
-            ["search", "--", "-c", "--json"],
+            ["search", "--json", "--", "-c"],
         )
         self.assertEqual(
             backend_args(TokenView(["search", "x", "--compact"])),
@@ -140,7 +149,7 @@ class CheckErrorTest(unittest.TestCase):
     def test_non_dict_info(self):
         code, out = self._run({"ok": False, "error": "boom"})
         self.assertEqual(code, EX_BACKEND)
-        self.assertEqual(out.strip(), "ERR backend: unknown error")
+        self.assertEqual(out.strip(), "ERR backend: boom")
 
     def test_ok_true_is_silent(self):
         buf = io.StringIO()
@@ -269,6 +278,92 @@ class RenderDetailTest(unittest.TestCase):
         out = render_detail(env)
         self.assertIn("  u/u1 +1: a1", out)
         self.assertIn("\n  a2", out)
+
+
+class RegressionTest(unittest.TestCase):
+    """Targeted defect remediation tests (task directive Phase 2-3)."""
+
+    def test_empty_envelope_no_keyerror(self):
+        # {"ok": true} without data renders header only.
+        self.assertEqual(_envelope_data({"ok": True}), {})
+        items, after = _listing_children({"ok": True})
+        self.assertEqual((items, after), ([], None))
+        out = render_listing({"ok": True}, show_sub=True)
+        self.assertEqual(out.strip(), LISTING_HEADER)
+
+    def test_null_data_node_no_attribute_error(self):
+        # Reddit truncated listings legitimately return data:null.
+        self.assertEqual(_envelope_data({"ok": True, "data": None}), {})
+        items, after = _listing_children({"ok": True, "data": None})
+        self.assertEqual((items, after), ([], None))
+        # Raw null children inside a listing must not crash either.
+        env = {"ok": True, "data": {"data": {"children": [
+            {"kind": "t3", "data": None},
+            {"kind": "t3", "data": {"id": "a1", "title": "t"}},
+        ], "after": None}}}
+        items, _ = _listing_children(env)
+        self.assertEqual(len(items), 1)
+
+    def test_non_dict_envelope_controlled(self):
+        self.assertEqual(_envelope_data([]), {})
+        self.assertEqual(_envelope_data("oops"), {})
+        # _run_compact guards non-dict envelopes; renderers stay total.
+        out = render_listing([], show_sub=True)
+        self.assertIn(LISTING_HEADER, out)
+
+    def test_double_dash_insertion(self):
+        v = TokenView(["search", "--", "-c"])
+        v.ensure("-n", "5", {"-n", "--limit"})
+        v.add_bare("--json")
+        self.assertEqual(v.tokens, ["search", "-n", "5", "--json", "--", "-c"])
+        # Value tokens after -- stay positional, never treated as options.
+        self.assertFalse(TokenView(["search", "--", "-n", "5"]).has({"-n", "--limit"}))
+
+    def test_packed_numeric_flag_classification(self):
+        # -n=5 packs its value; --subs-only stays a flag, not a value.
+        v = TokenView(["search", "-n=5", "--subs-only"])
+        self.assertEqual(v.kinds, ["p", "f", "f"])
+        self.assertEqual(v.value({"-n", "--limit"}), "5")
+        self.assertTrue(v.has({"--subs-only"}))
+
+    def test_packed_string_flag(self):
+        v = TokenView(["export", "x", "-otips.txt"])
+        self.assertIn(v._option_slot(2)[0], {"-o"})
+        self.assertEqual(v.value({"-o", "--output"}), "tips.txt")
+        self.assertEqual(TokenView(["cmd", "-rSub"]).value({"-r", "--subreddit"}), "Sub")
+        self.assertEqual(TokenView(["cmd", "-sTop"]).value({"-s", "--sort"}), "Top")
+
+    def test_duplicate_flags_last_wins(self):
+        v = TokenView(["export", "x", "-o", "first.txt", "-o", "second.txt"])
+        self.assertEqual(v.value({"-o", "--output"}), "second.txt")
+
+    def test_missing_subreddit_invariant(self):
+        row = _post_cells(1, {"id": "a1", "title": "t", "author": "a"})
+        self.assertEqual(row["sub"], "r/?")
+        line = post_line(1, {"id": "a1", "title": "t", "author": "a"}, show_sub=True)
+        self.assertIn("r/?", line)
+        self.assertEqual(len(line.split(" | ")), len(LISTING_HEADER.split(" | ")))
+
+    def test_remove_valued_options(self):
+        v = TokenView(["export", "x", "--format", "csv", "-o", "f.txt"])
+        v.remove({"--format"})
+        self.assertEqual(v.tokens, ["export", "x", "-o", "f.txt"])
+        v2 = TokenView(["export", "x", "--format=csv"])
+        v2.remove({"--format"})
+        self.assertEqual(v2.tokens, ["export", "x"])
+
+    def test_backend_error_passthrough_forwards_stderr(self):
+        import subprocess
+        proc = subprocess.CompletedProcess(
+            args=["rdt", "search"], returncode=1,
+            stdout="not-json\n", stderr="boom-stderr\n")
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as ctx:
+                load_envelope(proc)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(out_buf.getvalue(), "not-json\n")
+        self.assertEqual(err_buf.getvalue(), "boom-stderr\n")
 
 
 if __name__ == "__main__":
