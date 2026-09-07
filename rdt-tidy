@@ -727,7 +727,9 @@ def main(argv: list[str]) -> int:
         print(HELP)
         return EX_OK
     cmd, args = rest[0], rest[1:]
-    if "--help" in args or "-h" in args:
+    # Help flags respect `--` escaping: only real flags count, so a query
+    # like `search -- -h` searches for the literal text instead of help.
+    if TokenView(args).has({"-h", "--help"}):
         proc = run_backend([cmd] + args)
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)
