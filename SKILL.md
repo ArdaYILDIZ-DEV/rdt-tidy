@@ -20,7 +20,7 @@ description: Browse, search, and read Reddit via rdt-tidy compact tables (posts,
 | Subreddit / user / session info | `rdt-tidy --compact {sub-info <sub>,user <user>,whoami}` |
 | Export table to file | `rdt-tidy --compact export "<query>" -o <file>` (`-o` required) |
 
-`-n` default 5, cap 10. A `-c` written after the command belongs to rdt, not the wrapper. A query or text starting with `-` goes after `--`: `rdt-tidy -c search -- -c`. Full raw fields needed (timestamps, flairs, awards) instead of tables: plain mode passes through, e.g. `rdt-tidy sub <name> --json`.
+`-n` default 5, cap 10; `feed --subs-only` capped at 5x5; `export --compact` default `-n 50`, cap 50 and requires `-o`. In compact mode `-c`/`--compact` and `--yaml` are stripped when forwarding and `--json` is forced; synthesized flags are inserted before `--`, never after. A `-c` written after the command belongs to rdt, not the wrapper. A query or text starting with `-` goes after `--`: `rdt-tidy -c search -- -c`. Full raw fields needed (timestamps, flairs, awards) instead of tables: plain mode passes through, e.g. `rdt-tidy sub <name> --json`.
 
 ## Reading tables
 

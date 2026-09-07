@@ -27,7 +27,7 @@ Replace `{skill-dir}` with your harness's skill folder location, for example `.a
 
 ## Features
 
-- Passthrough output is byte-identical in normal mode; exit code is preserved.
+- Passthrough output is buffered via pipes (`subprocess.run(capture_output=True)`), preserving bytes but not strictly byte-identical (TTY color, signal bubbling, and interleaving differ); exit code is preserved.
 - Compact-mode tables are headed; text fields are never truncated, and line breaks in bodies and comments are kept.
 - Listing size limit: default 5, cap 10; `feed --subs-only` is capped at 5x5.
 - Position-independent option parsing: query and text fields (including `-c`, `-nonsense`) are never confused with flags.
