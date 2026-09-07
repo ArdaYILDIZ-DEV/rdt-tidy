@@ -232,4 +232,47 @@ with tempfile.TemporaryDirectory() as tmp:
     check("-- after -c preserved", argv == ["search", "--", "-c", "-n", "5", "--json"],
           repr(argv))
 
+    # 22. File output preserves the raw limit (no compact clamp to 10)
+    out1 = os.path.join(tmp, "list-out.txt")
+    open(log, "w").close()
+    run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+        "--compact", "sub", "python", "-n", "50", "-o", out1)
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("file -o keeps -n 50", "50" in argv and "10" not in argv, repr(argv))
+    check("file -o no compact --json", "--json" not in argv, repr(argv))
+    out2 = os.path.join(tmp, "list-out2.txt")
+    open(log, "w").close()
+    run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+        "--compact", "sub", "python", "-n", "50", f"--output={out2}")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("file --output= keeps -n 50", "50" in argv and "10" not in argv, repr(argv))
+
+    # 23. feed --subs-only=true triggers the 5x5 cap via structured parsing
+    open(log, "w").close()
+    run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+        "--compact", "feed", "--subs-only=true", "--max-subs", "20", "-n", "25")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("subs-only=true cap", "5" in argv and "20" not in argv and "25" not in argv,
+          repr(argv))
+
+    # 24. Export backend success without a file is a backend discrepancy
+    missing = os.path.join(tmp, "never-written.csv")
+    p = run({"RDT_EXPORT_SKIP": "1"}, "--compact", "export", "x", "-o", missing)
+    check("export missing file exit1", p.returncode == 1, str(p.returncode))
+    check("export missing file backend msg",
+          p.stderr.strip() == f"ERR backend: export did not write {missing}",
+          repr((p.stdout, p.stderr)))
+    check("export missing file not io", "ERR io" not in p.stderr, repr(p.stderr))
+
+    # 25. `--` escapes help flags: search for literal "-h" stays compact
+    open(log, "w").close()
+    p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+            "--compact", "search", "--", "-h")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("dashdash -h stays compact",
+          argv == ["search", "--", "-h", "-n", "5", "--json"], repr(argv))
+    check("dashdash -h renders table",
+          p.stdout.splitlines()[0] == "no | score | sub | title | author | id",
+          repr(p.stdout[:80]))
+
 print(f"\n{PASS} tests passed")

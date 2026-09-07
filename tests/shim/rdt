@@ -11,6 +11,11 @@ if log:
 
 argv = sys.argv[1:]
 if argv and argv[0] == "export":
+    # RDT_EXPORT_SKIP=1 simulates a backend that exits 0 without writing
+    # the file (stdout used / flag ignored) for the missing-file guard test.
+    if os.environ.get("RDT_EXPORT_SKIP") == "1":
+        print("", end="")
+        raise SystemExit(0)
     out = None
     for i, t in enumerate(argv):
         base = t.split("=", 1)[0] if t.startswith("--") else t
