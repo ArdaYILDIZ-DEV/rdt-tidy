@@ -45,15 +45,15 @@ with tempfile.TemporaryDirectory() as tmp:
             "--compact", "sub", "python")
     check("listing exit0", p.returncode == 0, p.stderr)
     lines = p.stdout.strip().splitlines()
-    check("listing 4 satir (baslik+2+next)", len(lines) == 4, repr(p.stdout))
-    check("listing baslik", lines[0] == "no | score | title | author | id", lines[0])
-    check("listing r/python yok (sub komutu)", "r/python" not in lines[1], lines[1])
-    check("listing id var", lines[1].endswith("| 1abc11"), lines[1])
+    check("listing 4 lines (header+2+next)", len(lines) == 4, repr(p.stdout))
+    check("listing header", lines[0] == "no | score | title | author | id", lines[0])
+    check("listing no r/python (sub command)", "r/python" not in lines[1], lines[1])
+    check("listing has id", lines[1].endswith("| 1abc11"), lines[1])
     check("listing next", lines[3] == "next t3_1abc22", lines[3])
     raw = open(fixture("listing.json"), encoding="utf-8").read()
     # Header adds a fixed ~35 bytes; 1/4 is the small-fixture bound
     # (live data observes ~1/20, 54KB -> 2.7KB).
-    check("listing oran<=1/4", len(p.stdout) * 4 <= len(raw),
+    check("listing ratio<=1/4", len(p.stdout) * 4 <= len(raw),
           f"{len(p.stdout)} vs {len(raw)}")
 
     # 2. Caps: -n 50 -> 10; default -> -n 5
@@ -81,52 +81,52 @@ with tempfile.TemporaryDirectory() as tmp:
             "--compact", "read", "1abc11")
     check("read exit0", p.returncode == 0, p.stderr)
     out = p.stdout
-    check("read baslik", out.splitlines()[0].startswith("# 1abc11 r/python"), out.splitlines()[0])
-    check("read govde tam", "uzun govde " * 5 in out and "[...]" not in out, out[:200])
-    check("read duz cevap girintili", "\n  u/zeynep" in out, out)
-    check("read ust yorum girintisiz", "\nu/dave" in out and "\nu/erin" in out, out)
-    check("read tum yorumlar", "u/erin" in out, out)
+    check("read header", out.splitlines()[0].startswith("# 1abc11 r/python"), out.splitlines()[0])
+    check("read body full", "uzun govde " * 5 in out and "[...]" not in out, out[:200])
+    check("read reply indented", "\n  u/zeynep" in out, out)
+    check("read top-level unindented", "\nu/dave" in out and "\nu/erin" in out, out)
+    check("read all comments", "u/erin" in out, out)
     check("read +2 more", "+2 more" in out, out)
-    check("read ham anahtar yok", "awardings" not in out and "selftext_html" not in out, "")
+    check("read no raw keys", "awardings" not in out and "selftext_html" not in out, "")
     raw = open(fixture("comments_raw.json"), encoding="utf-8").read()
-    check("read oran<=1/2", len(out) * 2 <= len(raw), f"{len(out)} vs {len(raw)}")
+    check("read ratio<=1/2", len(out) * 2 <= len(raw), f"{len(out)} vs {len(raw)}")
 
     # 5. Read from typed detail shape
     p = run({"RDT_FIXTURE": fixture("detail_typed.json")},
             "--compact", "read", "9zz")
     check("typed exit0", p.returncode == 0, p.stderr)
-    check("typed baslik", p.stdout.splitlines()[0].startswith("# 9zz r/go"), p.stdout)
-    check("typed yanit girintili", "\n  u/deli" in p.stdout, p.stdout)
-    check("typed ust yorum girintisiz", "\nu/veli" in p.stdout, p.stdout)
+    check("typed header", p.stdout.splitlines()[0].startswith("# 9zz r/go"), p.stdout)
+    check("typed reply indented", "\n  u/deli" in p.stdout, p.stdout)
+    check("typed top-level unindented", "\nu/veli" in p.stdout, p.stdout)
     check("typed more", "+4 more" in p.stdout, p.stdout)
 
     # 6. Error passthrough
     p = run({"RDT_FIXTURE": fixture("error.json")},
             "--compact", "search", "x")
-    check("hata exit1", p.returncode == 1, str(p.returncode))
-    check("hata satir", p.stdout.strip() == "ERR forbidden: Access forbidden: Resource",
+    check("error exit1", p.returncode == 1, str(p.returncode))
+    check("error line", p.stdout.strip() == "ERR forbidden: Access forbidden: Resource",
           repr(p.stdout))
 
     # 7. Passthrough is byte-identical
     p = run({"RDT_FIXTURE": fixture("listing.json")}, "sub", "python", "-n", "2")
-    check("normal aynen", p.stdout == open(fixture("listing.json"), encoding="utf-8").read()
+    check("passthrough identical", p.stdout == open(fixture("listing.json"), encoding="utf-8").read()
           and p.returncode == 0, repr(p.stdout[:100]))
 
     # 8) sub-info / user / whoami
     p = run({"RDT_FIXTURE": fixture("subinfo.json")}, "--compact", "sub-info", "python")
-    check("subinfo 3 satir", len(p.stdout.strip().splitlines()) == 3, repr(p.stdout))
-    check("subinfo html yok", "banner_img" not in p.stdout and "<p>" not in p.stdout, "")
+    check("subinfo 3 lines", len(p.stdout.strip().splitlines()) == 3, repr(p.stdout))
+    check("subinfo no html", "banner_img" not in p.stdout and "<p>" not in p.stdout, "")
     p = run({"RDT_FIXTURE": fixture("user.json")}, "--compact", "user", "spez")
-    check("user satir", p.stdout.strip() == "u/spez post:100 comment:200 age:2005-09-12",
+    check("user line", p.stdout.strip() == "u/spez post:100 comment:200 age:2005-09-12",
           repr(p.stdout))
     p = run({"RDT_FIXTURE": fixture("whoami.json")}, "--compact", "whoami")
-    check("whoami 2 satir", p.stdout.strip().splitlines() == [
+    check("whoami 2 lines", p.stdout.strip().splitlines() == [
         "u/spez post:100 comment:200 age:2005-09-12", "sess read,vote modhash:1"],
         repr(p.stdout))
 
     # 9. user-comments keeps the full body
     p = run({"RDT_FIXTURE": fixture("ucomments.json")}, "--compact", "user-comments", "u1")
-    check("ucomments tam", "[...]" not in p.stdout
+    check("ucomments full", "[...]" not in p.stdout
           and p.stdout.splitlines()[0] == "no | author | score | sub | body | id"
           and p.stdout.splitlines()[1].startswith("1 | u/u1 | +9 | r/python | yor")
           and p.stdout.splitlines()[1].endswith("| k1"), repr(p.stdout))
@@ -134,32 +134,32 @@ with tempfile.TemporaryDirectory() as tmp:
     # 10. saved mixes post/comment kinds
     p = run({"RDT_FIXTURE": fixture("mixed.json")}, "--compact", "saved")
     ls = p.stdout.strip().splitlines()
-    check("mixed baslik", ls[0] == "kind | no | score | sub | title/body | author | id",
+    check("mixed header", ls[0] == "kind | no | score | sub | title/body | author | id",
           repr(p.stdout))
     check("mixed P/C", ls[1].startswith("P | 1 ") and ls[2].startswith("C | 2 "),
           repr(p.stdout))
 
     # 11. Compact export requires -o
     p = run({}, "--compact", "export", "x")
-    check("export -o sart", p.returncode == 2, str(p.returncode))
+    check("export -o required", p.returncode == 2, str(p.returncode))
     out_csv = os.path.join(tmp, "out.txt")
     csv_text = ("title,subreddit,author,score,num_comments,url,permalink\n"
-                "Merhaba dunya,python,ali,10,3,https://ex.com/a,/r/python/a/\n")
+                "Hello world,python,ali,10,3,https://ex.com/a,/r/python/a/\n")
     p = run({"RDT_EXPORT_CSV": csv_text}, "--compact", "export", "x", "-o", out_csv)
     check("export exit0", p.returncode == 0, p.stderr)
     content = open(out_csv, encoding="utf-8").read()
     check("export minimal", content.strip() == "score | sub | title | author | url\n"
-          "+10c3 | r/python | Merhaba dunya | u/ali | https://ex.com/a",
+          "+10c3 | r/python | Hello world | u/ali | https://ex.com/a",
           repr(content))
-    check("export ozet", p.stdout.strip() == f"saved {out_csv} (1 rows)", repr(p.stdout))
+    check("export summary", p.stdout.strip() == f"saved {out_csv} (1 rows)", repr(p.stdout))
 
     # 12. Trailing -c stays with rdt (passthrough)
     open(log, "w").close()
     p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
             "comment", "3", "-c")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("-c metin korunur", argv == ["comment", "3", "-c"], repr(argv))
-    check("-c normal kip", p.stdout == open(fixture("listing.json"), encoding="utf-8").read(), "")
+    check("-c text preserved", argv == ["comment", "3", "-c"], repr(argv))
+    check("-c passthrough mode", p.stdout == open(fixture("listing.json"), encoding="utf-8").read(), "")
 
     # 13. Trailing --compact does not enable tidy mode
     open(log, "w").close()
@@ -174,21 +174,21 @@ with tempfile.TemporaryDirectory() as tmp:
     p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
             "--compact", "search", "x", "--compact")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("rdt -c dusurulur", "--compact" not in argv and "--json" in argv, repr(argv))
-    check("yine compact cikti", p.stdout.splitlines()[1].startswith("1 | "), repr(p.stdout[:80]))
+    check("rdt -c stripped", "--compact" not in argv and "--json" in argv, repr(argv))
+    check("still compact output", p.stdout.splitlines()[1].startswith("1 | "), repr(p.stdout[:80]))
 
     # 15. Compact forces --json over --yaml
     open(log, "w").close()
     p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
             "--compact", "sub", "python", "--yaml")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("yaml dusurulur", "--yaml" not in argv and "--json" in argv, repr(argv))
+    check("yaml stripped", "--yaml" not in argv and "--json" in argv, repr(argv))
 
     # 16. Empty stdout becomes ERR with exit 1
     open(os.path.join(tmp, "empty.json"), "w").close()
     p = run({"RDT_FIXTURE": os.path.join(tmp, "empty.json")},
             "--compact", "sub", "python")
-    check("bos cikti exit1", p.returncode == 1 and p.stdout.startswith("ERR backend:"),
+    check("empty output exit1", p.returncode == 1 and p.stdout.startswith("ERR backend:"),
           repr((p.returncode, p.stdout)))
 
     # 17. Packed -n50 -> -n10
@@ -216,7 +216,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # 20. Negative score prints as -5, not +-
     p = run({"RDT_FIXTURE": fixture("neg.json")}, "--compact", "sub", "s")
-    check("negatif skor", p.stdout.splitlines()[1].startswith("1 | -5c0 | "),
+    check("negative score", p.stdout.splitlines()[1].startswith("1 | -5c0 | "),
           repr(p.stdout))
 
     # 21. Flag-position -c belongs to rdt; text after `--` is kept
@@ -224,12 +224,12 @@ with tempfile.TemporaryDirectory() as tmp:
     run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
         "-c", "search", "-c")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("-c flag dusurulur", argv == ["search", "-n", "5", "--json"], repr(argv))
+    check("-c flag stripped", argv == ["search", "-n", "5", "--json"], repr(argv))
     open(log, "w").close()
     run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
         "-c", "search", "--", "-c")
     argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
-    check("-- sonrasi -c korunur", argv == ["search", "--", "-c", "-n", "5", "--json"],
+    check("-- after -c preserved", argv == ["search", "--", "-c", "-n", "5", "--json"],
           repr(argv))
 
-print(f"\n{PASS} test gecti")
+print(f"\n{PASS} tests passed")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sahte rdt: argv'yi loglar, fixture basar. Testler PATH'e bu dizini koyar."""
+"""Fake rdt: logs argv, prints fixture. Tests prepend this dir to PATH."""
 import json
 import os
 import sys
