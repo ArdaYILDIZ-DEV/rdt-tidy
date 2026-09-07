@@ -147,6 +147,24 @@ VALUE_OPTS = {
 TIDY_FLAGS = {"-c", "--compact"}
 
 
+def _looks_like_flag(token: str) -> bool:
+    """Return True when a token looks like a CLI flag, not positional text.
+
+    Leading-dash tokens are flags except for negative numbers, which are
+    positional query/text values:
+      flags: ``-n``, ``--limit``, ``--subs-only``, ``-nonsense``
+      positional: ``-5`` (int), ``-3.14`` (float), ``-`` (bare dash),
+        ``hello`` (no leading dash)
+    The ``--`` separator and ``--name=value`` forms are handled by the
+    caller in ``_classify`` before this helper runs.
+    """
+    if len(token) <= 1 or not token.startswith("-"):
+        return False
+    # Strip one leading dash plus any extra (``--``) and a single dot so
+    # negative ints/floats (``-5``, ``-3.14``) read as digits, not flags.
+    return not token[1:].lstrip("-").replace(".", "", 1).isdigit()
+
+
 def _classify(tokens: list[str]) -> list[str]:
     """Classify each token as flag (f), value (v), or positional (p)."""
     kinds: list[str] = []
@@ -167,7 +185,7 @@ def _classify(tokens: list[str]) -> list[str]:
         if t.startswith("--") and "=" in t:
             kinds.append("f")
             continue
-        if len(t) > 1 and t.startswith("-") and not t[1:].lstrip("-").replace(".", "", 1).isdigit():
+        if _looks_like_flag(t):
             kinds.append("f")
             if t.split("=", 1)[0] in VALUE_OPTS:
                 expect_val = True
