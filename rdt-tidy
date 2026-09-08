@@ -559,14 +559,30 @@ def render_mixed(env: object) -> str:
 def _typed_replies(node: dict) -> list[dict]:
     out: list[dict] = []
     for rep in node.get("replies", []) or []:
-        if isinstance(rep, dict):
-            out.append({
-                "author": rep.get("author", "?"),
-                "body": rep.get("body", ""),
-                "score": rep.get("score", 0),
-                "depth": 1,
-            })
+        if not isinstance(rep, dict):
+            continue
+        if rep.get("author") == "[more]" or rep.get("kind") == "more":
+            continue
+        out.append({
+            "author": rep.get("author", "?"),
+            "body": rep.get("body", ""),
+            "score": rep.get("score", 0),
+            "depth": 1,
+        })
+        out.extend(_typed_replies(rep))
     return out
+
+
+def _typed_more(node: dict) -> int:
+    more = 0
+    for rep in node.get("replies", []) or []:
+        if not isinstance(rep, dict):
+            continue
+        if rep.get("author") == "[more]" or rep.get("kind") == "more":
+            more += int(rep.get("more_count") or len(rep.get("more_children", []) or []) or 1)
+        else:
+            more += int(rep.get("more_count") or 0) + _typed_more(rep)
+    return more
 
 
 def _raw_comment_of(d: dict, depth: int = 0) -> dict:
@@ -575,7 +591,7 @@ def _raw_comment_of(d: dict, depth: int = 0) -> dict:
         "author": d.get("author", "?"),
         "body": d.get("body", ""),
         "score": d.get("score", 0),
-        "depth": depth,
+        "depth": min(depth, 1),
     }
 
 
@@ -591,7 +607,14 @@ def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> in
     if not isinstance(d, dict):
         return 0
     comments.append(_raw_comment_of(d, depth))
-    return 0
+    more = 0
+    replies = d.get("replies")
+    if isinstance(replies, dict):
+        rdata = replies.get("data")
+        if isinstance(rdata, dict):
+            for rchild in rdata.get("children") or []:
+                more += _absorb_raw_child(rchild, comments, depth=1)
+    return more
 
 
 def _parse_typed_detail(data: dict) -> tuple[dict, list[dict], int]:
@@ -599,12 +622,17 @@ def _parse_typed_detail(data: dict) -> tuple[dict, list[dict], int]:
     raw_post = data.get("post") or {}
     post = raw_post if isinstance(raw_post, dict) else {}
     comments: list[dict] = []
+    more = int(data.get("more_count") or 0)
     for node in data.get("comments") or []:
         if not isinstance(node, dict):
             continue
+        if node.get("author") == "[more]" or node.get("kind") == "more":
+            more += int(node.get("more_count") or len(node.get("more_children", []) or []) or 1)
+            continue
         comments.append({**node, "depth": 0})
+        more += _typed_more(node)
         comments.extend(_typed_replies(node))
-    return post, comments, int(data.get("more_count") or 0)
+    return post, comments, more
 
 
 def _parse_raw_detail(data: list) -> tuple[dict, list[dict], int]:
@@ -623,15 +651,7 @@ def _parse_raw_detail(data: list) -> tuple[dict, list[dict], int]:
     more = 0
     second = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
     for child in (second.get("data") or {}).get("children", []) or []:
-        more += _absorb_raw_child(child, comments)
-        if not (isinstance(child, dict) and child.get("kind") == "t1"):
-            continue
-        d = child.get("data") or {}
-        if not (isinstance(d, dict) and isinstance(d.get("replies") or {}, dict)):
-            continue
-        replies = d.get("replies") or {}
-        for rchild in (replies.get("data") or {}).get("children", []) or []:
-            more += _absorb_raw_child(rchild, comments, depth=1)
+        more += _absorb_raw_child(child, comments, depth=0)
     return post, comments, more
 
 
@@ -657,7 +677,13 @@ def render_detail(env: object) -> str:
         f"| u/{post.get('author', '?')} {_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c)"
     ]
     url = str(post.get("url", "") or "")
-    if url and not post.get("is_self", True):
+    is_self = post.get("is_self")
+    if is_self is None:
+        permalink = str(post.get("permalink", "") or "")
+        is_link = bool(url and url != permalink and not (permalink and url.endswith(permalink)))
+    else:
+        is_link = bool(url and not is_self)
+    if is_link:
         lines.append(f"LINK {url}")
     body = flow(post.get("selftext", "") or "")
     if body:
@@ -802,10 +828,10 @@ def cmd_export_compact(rest: list[str]) -> int:
     view.cap({"-n", "--count"}, EXPORT_CAP_N)
     view.ensure("-n", str(EXPORT_CAP_N), {"-n", "--count"})
     # Readable CSV as the intermediate format, then shrink to short lines.
+    view.drop(TIDY_FLAGS | {"--yaml"})
     view.remove({"--format"})
-    at = view._insertion_point()
-    cleaned = view.tokens[:at] + ["--format", "csv"] + view.tokens[at:]
-    proc = run_backend(["export"] + cleaned)
+    view.ensure("--format", "csv", {"--format"})
+    proc = run_backend(["export"] + view.tokens)
     if proc.returncode != 0:
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)

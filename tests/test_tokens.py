@@ -365,6 +365,104 @@ class RegressionTest(unittest.TestCase):
         self.assertEqual(out_buf.getvalue(), "not-json\n")
         self.assertEqual(err_buf.getvalue(), "boom-stderr\n")
 
+    def test_raw_nested_depth_comments_and_more(self):
+        data = [
+            {"data": {"children": [{"data": {"id": "p1", "title": "Post Title"}}]}},
+            {"data": {"children": [
+                {"kind": "t1", "data": {
+                    "id": "c1", "author": "u1", "body": "depth-0", "score": 1,
+                    "replies": {"data": {"children": [
+                        {"kind": "t1", "data": {
+                            "id": "c2", "author": "u2", "body": "depth-1", "score": 1,
+                            "replies": {"data": {"children": [
+                                {"kind": "t1", "data": {
+                                    "id": "c3", "author": "u3", "body": "depth-2", "score": 1,
+                                    "replies": {"data": {"children": [
+                                        {"kind": "more", "data": {"children": ["c4", "c5"]}}
+                                    ]}}
+                                }}
+                            ]}}
+                        }}
+                    ]}}
+                }},
+                {"kind": "more", "data": {"children": ["c6"]}}
+            ]}},
+        ]
+        post, comments, more = parse_detail(data)
+        self.assertEqual(len(comments), 3, f"Expected 3 comments, got {len(comments)}")
+        self.assertEqual(comments[0]["depth"], 0)
+        self.assertEqual(comments[1]["depth"], 1)
+        self.assertEqual(comments[2]["depth"], 1)
+        self.assertEqual(more, 3)
+
+    def test_typed_nested_depth_comments_and_more(self):
+        data = {
+            "post": {"id": "p1", "title": "Post Title"},
+            "comments": [
+                {
+                    "author": "u1", "body": "depth-0", "score": 1,
+                    "replies": [
+                        {
+                            "author": "u2", "body": "depth-1", "score": 1,
+                            "replies": [
+                                {
+                                    "author": "u3", "body": "depth-2", "score": 1,
+                                    "replies": [
+                                        {"author": "[more]", "more_count": 2, "more_children": ["x", "y"]}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "more_count": 1,
+        }
+        post, comments, more = parse_detail(data)
+        self.assertEqual(len(comments), 3, f"Expected 3 comments, got {len(comments)}")
+        self.assertEqual(comments[0]["depth"], 0)
+        self.assertEqual(comments[1]["depth"], 1)
+        self.assertEqual(comments[2]["depth"], 1)
+        self.assertEqual(more, 3)
+
+    def test_render_detail_is_self_fallback(self):
+        # 1. Missing is_self with external URL -> emits LINK
+        env1 = {"data": {
+            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
+                     "permalink": "/r/news/comments/p1/t/"},
+            "comments": [], "more_count": 0,
+        }}
+        out1 = render_detail(env1)
+        self.assertIn("LINK https://example.com/art", out1)
+
+        # 2. is_self is None with external URL -> emits LINK
+        env2 = {"data": {
+            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
+                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
+            "comments": [], "more_count": 0,
+        }}
+        out2 = render_detail(env2)
+        self.assertIn("LINK https://example.com/art", out2)
+
+        # 3. is_self is None with url matching permalink -> no LINK
+        env3 = {"data": {
+            "post": {"id": "p1", "title": "t", "url": "https://www.reddit.com/r/news/comments/p1/t/",
+                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
+            "comments": [], "more_count": 0,
+        }}
+        out3 = render_detail(env3)
+        self.assertNotIn("LINK", out3)
+
+        # 4. is_self explicitly True -> no LINK even if url is non-empty
+        env4 = {"data": {
+            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
+                     "permalink": "/r/news/comments/p1/t/", "is_self": True},
+            "comments": [], "more_count": 0,
+        }}
+        out4 = render_detail(env4)
+        self.assertNotIn("LINK", out4)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

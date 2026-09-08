@@ -353,4 +353,15 @@ with tempfile.TemporaryDirectory() as tmp:
     check("bad json stdout passthrough", p.stdout == "not-json\n", repr(p.stdout))
     check("bad json stderr forwarded", "boom-stderr" in p.stderr, repr(p.stderr))
 
+    # 34. Export compact strips -c / --compact / --yaml before backend
+    out4 = os.path.join(tmp, "exp4.csv")
+    open(log, "w").close()
+    p = run({"RDT_EXPORT_CSV": csv_text2, "RDT_ARGV_LOG": log},
+            "--compact", "export", "-c", "x", "-o", out4, "--yaml", "--compact")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("export strips -c", "-c" not in argv, repr(argv))
+    check("export strips --compact", "--compact" not in argv, repr(argv))
+    check("export strips --yaml", "--yaml" not in argv, repr(argv))
+    check("export format csv", "--format" in argv and "csv" in argv, repr(argv))
+
 print(f"\n{PASS} tests passed")
