@@ -29,6 +29,9 @@ Replace `{skill-dir}` with your harness's skill folder location, for example `.a
 
 - Passthrough output is buffered via pipes (`subprocess.run(capture_output=True)`), preserving bytes but not strictly byte-identical (TTY color, signal bubbling, and interleaving differ); exit code is preserved.
 - Compact-mode tables are headed; text fields are never truncated, and line breaks in bodies and comments are kept.
+- Subtree traversal for comment threads is fully recursive across arbitrary reply depths (depth >= 2); rendered replies flatten to a single indented level, and unexpanded `more` stubs across the entire tree are accumulated without data loss.
+- External links are detected defensively: `LINK {url}` is emitted whenever a non-empty URL differs from the permalink, even if `is_self` is omitted or null in the payload.
+- `export --compact` cleans invocation flags: `-c`, `--compact`, and `--yaml` are stripped before delegating to `rdt export --format csv`.
 - Listing size limit: default 5, cap 10; `feed --subs-only` is capped at 5x5.
 - Position-independent option parsing: query and text fields (including `-c`, `-nonsense`) are never confused with flags.
 - Empty backend output is never silently passed through; it returns `ERR backend` with exit code 1.
@@ -133,17 +136,17 @@ Every option except the mode flag is forwarded to the matching rdt command as-is
 | `export` | Short lines written to a file, only a summary on stdout |
 | `open`, `upvote`, `save`, `subscribe`, `comment`, `login`, `logout` | Passed through |
 
-In compact mode, `-n` defaults to 5 and caps at 10 for every command except `read` and `show`. For `read` and `show`, `-n` goes to the backend as-is with no cap.
+In compact mode, `-n` defaults to 5 and caps at 10 for every command except `read` and `show`. For `read` and `show`, `-n` goes to the backend as-is with no cap. In `export --compact`, tidy-specific flags (`-c`, `--compact`, `--yaml`) are stripped, and the backend is invoked with `--format csv` to produce an intermediate file before rewriting to short lines.
 
 ## Comment expansion
 
-A default `read` makes a single request; unopened comments collapse into a `+<count> more` line. To open everything:
+A default `read` makes a single request; unopened comments collapse into a `+<count> more` line. To expand additional nodes:
 
 ```sh
 rdt-tidy -c read 1abc123 -n 100 --expand-more
 ```
 
-`--expand-more` makes the backend send extra requests and opens closed top-level comments. If nested nodes still cannot be opened, the `+<count> more` line is kept; that line is a remainder count, not data loss.
+`--expand-more` makes the backend send extra requests to open closed comment stubs. `rdt-tidy` recursively traverses all reply subtrees across arbitrary nesting depths (depth >= 2), flattening comments to a single reply level (`depth=1`, two-space indented). Any unexpanded `more` stubs encountered anywhere in the subtree are recursively accumulated into the trailing `+<count> more` remainder line, ensuring zero silent comment loss.
 
 ## Troubleshooting
 
@@ -174,10 +177,10 @@ The backend did not return within 30 seconds. Check the network connection and r
 ## How it works
 
 1. The mode flag is looked up before the command; when absent, the command and options go to `rdt` unchanged.
-2. In compact mode the backend call uses raw `--json`; rdt's own `-c`/`--compact` and `--yaml` flags are dropped.
+2. In compact mode the backend call uses raw `--json` (or `--format csv` for `export`); rdt's own `-c`/`--compact` and `--yaml` flags are dropped.
 3. Limit options (`-n`, `--limit`, `--max-subs`) are clamped to the caps; missing ones get defaults. Positional fields stay untouched.
 4. The returned envelope is parsed; on `ok: false`, `ERR <code>: <message>` prints and the exit code becomes 1.
-5. Records are rendered into the matching format for the command type and written to stdout.
+5. Records are rendered into the matching format for the command type and written to stdout. For threads, subtrees are recursively traversed, replies flatten to depth 1, and all nested `more` counts are summed into the remainder line. External links print with `LINK {url}` whenever the URL differs from the permalink.
 
 Empty backend output never loses data: `ERR backend: ...` prints and the process exits 1. When stdout is not JSON, it passes through as-is.
 
@@ -206,7 +209,7 @@ u/dave +150: comment (full)
 +2 more
 ```
 
-All comments print, replies flatten to one level and carry a two-space indent, and reply continuation lines keep the same indent. Line breaks survive in bodies and comments (inline whitespace collapses, runs of blank lines shrink to one). `more_children` ids never print; only the `+<count> more` line stays.
+All comments print; nested replies of arbitrary depth flatten to a single reply level with a two-space indent, and reply continuation lines keep the same indent. Line breaks survive in bodies and comments (inline whitespace collapses, runs of blank lines shrink to one). `LINK {url}` prints for external link posts whenever `url` is present and differs from `permalink` (or `is_self` is false). `more_children` ids never print; all unexpanded stubs across the entire subtree are summed into the trailing `+<count> more` line.
 
 Info commands:
 
@@ -234,8 +237,8 @@ status   →  passed through
 | Listing record count | Default 5, cap 10 |
 | `feed --subs-only` | At most 5 subscriptions, 5 records per subscription |
 | Title, body, comment, description | Never truncated, printed in full |
-| Comment depth | Replies flatten to one level, marked by indent |
-| `export --compact` | At most 50 lines, `-o FILE` required |
+| Comment depth | Recursive traversal; replies flatten to one level, marked by indent |
+| `export --compact` | At most 50 lines, `-o FILE` required, tidy flags stripped, intermediate CSV format |
 | Backend timeout | 30 seconds |
 
 ## Data files
@@ -264,7 +267,7 @@ python3 tests/test_tidy.py
 python3 tests/test_tokens.py
 ```
 
-The suite holds 52 end-to-end tests and 15 unit tests, and needs no network access. Live smoke test, no login required:
+The suite holds 34 end-to-end test scenarios (81 assertions) and 48 unit tests, and needs no network access. Live smoke test, no login required:
 
 ```sh
 diff <(rdt status) <(./rdt-tidy status)

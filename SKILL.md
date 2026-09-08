@@ -13,14 +13,14 @@ description: Browse, search, and read Reddit via rdt-tidy compact tables (posts,
 |---|---|
 | Read post + all comments | `rdt-tidy --compact read <id>` (id = `/comments/<id>/` segment of the URL) |
 | Read nth item of the last listing | `rdt-tidy --compact show <n>` (run a list command first, it reads from cache) |
-| Open closed top-level comments | add `--expand-more` |
+| Open closed comment stubs | add `--expand-more` |
 | Search Reddit / in a subreddit | `rdt-tidy --compact search "<query>" [-r <sub>] [-n 5]` |
 | Browse | `rdt-tidy --compact {feed,popular,all,sub <name>,user-posts <user>} [-n 5]` |
 | User comments / saved / upvoted | `rdt-tidy --compact {user-comments <user>,saved,upvoted}` |
 | Subreddit / user / session info | `rdt-tidy --compact {sub-info <sub>,user <user>,whoami}` |
 | Export table to file | `rdt-tidy --compact export "<query>" -o <file>` (`-o` required) |
 
-`-n` default 5, cap 10; `feed --subs-only` capped at 5x5; `export --compact` default `-n 50`, cap 50 and requires `-o`. In compact mode `-c`/`--compact` and `--yaml` are stripped when forwarding and `--json` is forced; synthesized flags are inserted before `--`, never after. A `-c` written after the command belongs to rdt, not the wrapper. A query or text starting with `-` goes after `--`: `rdt-tidy -c search -- -c`. Full raw fields needed (timestamps, flairs, awards) instead of tables: plain mode passes through, e.g. `rdt-tidy sub <name> --json`.
+`-n` default 5, cap 10; `feed --subs-only` capped at 5x5; `export --compact` default `-n 50`, cap 50 and requires `-o`. In compact mode `-c`/`--compact` and `--yaml` are stripped when forwarding (`--json` is forced for listings/details, `--format csv` for `export`); synthesized flags are inserted before `--`, never after. A `-c` written after the command belongs to rdt, not the wrapper. A query or text starting with `-` goes after `--`: `rdt-tidy -c search -- -c`. Full raw fields needed (timestamps, flairs, awards) instead of tables: plain mode passes through, e.g. `rdt-tidy sub <name> --json`.
 
 ## Reading tables
 
@@ -32,15 +32,16 @@ description: Browse, search, and read Reddit via rdt-tidy compact tables (posts,
 
 ```text
 # <id> <sub> | <title> | u/<author> +<score> (<n>c)
-[LINK <url>]              # only for external-link posts
+[LINK <url>]              # external links (emitted when url differs from permalink)
 <body, paragraph breaks kept>
 ---
 u/<author> +<score>: <top-level comment>
   u/<author> +<score>: <reply, two-space indented>
-+<n> more                 # closed comments leftovers
++<n> more                 # unexpanded comment remainder across full subtree
 ```
 
-- A comment starting with two spaces is a reply to the nearest non-indented comment above it; its continuation lines carry the same indent. Blank lines inside a body are paragraph breaks, not separators.
+- A comment starting with two spaces is a reply to the nearest non-indented comment above it; its continuation lines carry the same indent. Subtree traversal is recursive across arbitrary reply depth; all nested replies flatten to this single indented level (`depth=1`).
+- Unexpanded `[more]` stubs encountered at any depth in the comment tree are summed into the trailing `+<n> more` remainder count without silent omission. Blank lines inside a body are paragraph breaks, not separators.
 
 Worked miniature (fields left to right):
 
