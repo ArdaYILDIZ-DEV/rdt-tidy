@@ -29,7 +29,7 @@ Replace `{skill-dir}` with your harness's skill folder location, for example `.a
 
 - Passthrough output is buffered via pipes (`subprocess.run(capture_output=True)`), preserving bytes but not strictly byte-identical (TTY color, signal bubbling, and interleaving differ); exit code is preserved.
 - Compact-mode tables are headed; text fields are never truncated, and line breaks in bodies and comments are kept.
-- Subtree traversal for comment threads is fully recursive across arbitrary reply depths (depth >= 2); rendered replies flatten to a single indented level, and unexpanded `more` stubs across the entire tree are accumulated without data loss.
+- Subtree traversal for comment threads is iterative across arbitrary reply depths (depth >= 2), so hostile nesting cannot exhaust the call stack; rendered replies flatten to a single indented level, and unexpanded `more` stubs across the entire tree are accumulated without data loss.
 - External links are detected defensively: `LINK {url}` is emitted whenever a non-empty URL differs from the permalink, even if `is_self` is omitted or null in the payload.
 - `export --compact` cleans invocation flags: `-c`, `--compact`, and `--yaml` are stripped before delegating to `rdt export --format csv`.
 - Listing size limit: default 5, cap 10; `feed --subs-only` is capped at 5x5.
@@ -146,7 +146,7 @@ A default `read` makes a single request; unopened comments collapse into a `+<co
 rdt-tidy -c read 1abc123 -n 100 --expand-more
 ```
 
-`--expand-more` makes the backend send extra requests to open closed comment stubs. `rdt-tidy` recursively traverses all reply subtrees across arbitrary nesting depths (depth >= 2), flattening comments to a single reply level (`depth=1`, two-space indented). Any unexpanded `more` stubs encountered anywhere in the subtree are recursively accumulated into the trailing `+<count> more` remainder line, ensuring zero silent comment loss.
+`--expand-more` makes the backend send extra requests to open closed comment stubs. `rdt-tidy` traverses all reply subtrees iteratively across arbitrary nesting depths (depth >= 2), flattening comments to a single reply level (`depth=1`, two-space indented). Any unexpanded `more` stubs encountered anywhere in the subtree are accumulated into the trailing `+<count> more` remainder line, ensuring zero silent comment loss.
 
 ## Troubleshooting
 
@@ -174,13 +174,25 @@ rdt-tidy --compact export "python tips" -o tips.txt
 
 The backend did not return within 30 seconds. Check the network connection and retry with a smaller limit (`-n 5`).
 
+### `ERR backend: invalid envelope`
+
+The backend returned JSON that is not a listing envelope (a bare array or string, for example). Exit code 1; no traceback. Inspect the backend output directly to diagnose.
+
+### `ERR io: cannot read ...` / `cannot parse ...` / `cannot write ...`
+
+Local file failure around the export path: an unreadable input CSV, a malformed CSV (an oversized cell, for example), or an unwritable target directory. Exit code 1.
+
+### `ERR backend: cannot execute rdt: ...`
+
+The `rdt` binary exists but the OS refused to run it (permissions or binary format). Check `ls -l $(which rdt)` and reinstall rdt-cli if needed.
+
 ## How it works
 
 1. The mode flag is looked up before the command; when absent, the command and options go to `rdt` unchanged.
 2. In compact mode the backend call uses raw `--json` (or `--format csv` for `export`); rdt's own `-c`/`--compact` and `--yaml` flags are dropped.
-3. Limit options (`-n`, `--limit`, `--max-subs`) are clamped to the caps; missing ones get defaults. Positional fields stay untouched.
+3. Limit options (`-n`, `--limit`, `--count`, `--max-subs`) are clamped to the caps; missing ones get defaults. Positional fields stay untouched.
 4. The returned envelope is parsed; on `ok: false`, `ERR <code>: <message>` prints and the exit code becomes 1.
-5. Records are rendered into the matching format for the command type and written to stdout. For threads, subtrees are recursively traversed, replies flatten to depth 1, and all nested `more` counts are summed into the remainder line. External links print with `LINK {url}` whenever the URL differs from the permalink.
+5. Records are rendered into the matching format for the command type and written to stdout. For threads, subtrees are traversed iteratively, replies flatten to depth 1, and all nested `more` counts are summed into the remainder line. External links print with `LINK {url}` whenever the URL differs from the permalink.
 
 Empty backend output never loses data: `ERR backend: ...` prints and the process exits 1. When stdout is not JSON, it passes through as-is.
 
@@ -237,13 +249,13 @@ status   →  passed through
 | Listing record count | Default 5, cap 10 |
 | `feed --subs-only` | At most 5 subscriptions, 5 records per subscription |
 | Title, body, comment, description | Never truncated, printed in full |
-| Comment depth | Recursive traversal; replies flatten to one level, marked by indent |
+| Comment depth | Iterative traversal (no recursion limit); replies flatten to one level, marked by indent |
 | `export --compact` | At most 50 lines, `-o FILE` required, tidy flags stripped, intermediate CSV format |
 | Backend timeout | 30 seconds |
 
 ## Data files
 
-rdt-tidy creates no config file of its own and stores no credentials. It reuses rdt-cli's files under `~/.config/rdt-cli/` as-is (`credential.json` for cookies, `index_cache.json` for short-index navigation). The only write path is the export file given via `-o`; an existing file is silently overwritten.
+rdt-tidy creates no config file of its own and stores no credentials. It reuses rdt-cli's files under `~/.config/rdt-cli/` as-is (`credential.json` for cookies, `index_cache.json` for short-index navigation). The only write path is the export file given via `-o`; an existing file is silently overwritten. The export is staged through a uniquely named temp file in the target directory and moved into place atomically; the temp file carries `0600` permissions.
 
 ## Project structure
 
@@ -252,8 +264,9 @@ rdt-tidy creates no config file of its own and stores no credentials. It reuses 
 ├── rdt-tidy               # wrapper (single file, executable)
 ├── README.md              # this file
 └── tests
-    ├── test_tidy.py       # end-to-end tests (with fake rdt)
-    ├── test_tokens.py     # TokenView unit tests
+    ├── test_tidy.py                # end-to-end tests, isolated TestCase methods (with fake rdt)
+    ├── test_tokens.py              # unit tests: TokenView, detail parsing, export, backend errors
+    ├── test_detail_robustness.py   # regression tests: malformed envelopes, deep nesting
     ├── shim
     │   └── rdt            # fake rdt binary for tests
     └── fixtures            # 10 synthetic JSON responses
@@ -267,7 +280,20 @@ python3 tests/test_tidy.py
 python3 tests/test_tokens.py
 ```
 
-The suite holds 34 end-to-end test scenarios (81 assertions) and 48 unit tests, and needs no network access. Live smoke test, no login required:
+The suite holds 37 end-to-end scenarios, 58 unit tests, and 17 regression tests (112 total) and needs no network access. Full run:
+
+```sh
+python3 -m unittest discover tests
+```
+
+Direct runners work too:
+
+```sh
+python3 tests/test_tidy.py
+python3 tests/test_tokens.py
+```
+
+Live smoke test, no login required:
 
 ```sh
 diff <(rdt status) <(./rdt-tidy status)
