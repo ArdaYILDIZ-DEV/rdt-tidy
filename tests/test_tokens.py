@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Unit tests for TokenView edge cases (no e2e shim)."""
+
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import os
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_loader = importlib.machinery.SourceFileLoader("rdt_tidy", os.path.join(ROOT, "rdt-tidy"))
+_loader = importlib.machinery.SourceFileLoader(
+    "rdt_tidy", os.path.join(ROOT, "rdt-tidy")
+)
 _spec = importlib.util.spec_from_loader("rdt_tidy", _loader)
 _mod = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_mod)
@@ -19,6 +24,7 @@ TIDY_FLAGS = _mod.TIDY_FLAGS
 check_error = _mod.check_error
 _looks_like_flag = _mod._looks_like_flag
 EX_BACKEND = _mod.EX_BACKEND
+EX_OK = _mod.EX_OK
 parse_detail = _mod.parse_detail
 render_detail = _mod.render_detail
 _envelope_data = _mod._envelope_data
@@ -70,12 +76,19 @@ class TokenViewTest(unittest.TestCase):
         self.assertEqual(v.tokens, ["search", "x", "-n", "3"])
 
     def test_value_forms(self):
-        self.assertEqual(TokenView(["export", "x", "-o", "f.txt"]).value({"-o", "--output"}), "f.txt")
-        self.assertEqual(TokenView(["export", "x", "--output=f.txt"]).value({"-o", "--output"}), "f.txt")
+        self.assertEqual(
+            TokenView(["export", "x", "-o", "f.txt"]).value({"-o", "--output"}), "f.txt"
+        )
+        self.assertEqual(
+            TokenView(["export", "x", "--output=f.txt"]).value({"-o", "--output"}),
+            "f.txt",
+        )
         self.assertIsNone(TokenView(["export", "x"]).value({"-o", "--output"}))
 
     def test_value_packed_short(self):
-        self.assertEqual(TokenView(["search", "x", "-n50"]).value({"-n", "--limit"}), "50")
+        self.assertEqual(
+            TokenView(["search", "x", "-n50"]).value({"-n", "--limit"}), "50"
+        )
 
     def test_drop_bare_flags(self):
         v = TokenView(["search", "x", "--compact", "--yaml"])
@@ -124,9 +137,8 @@ class CheckErrorTest(unittest.TestCase):
 
     def _run(self, env):
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                check_error(env)
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as ctx:
+            check_error(env)
         return ctx.exception.code, buf.getvalue()
 
     def test_missing_message_key(self):
@@ -225,9 +237,21 @@ class ParseDetailTest(unittest.TestCase):
     def test_list_shape(self):
         data = [
             {"data": {"children": [{"data": {"id": "p1", "title": "t"}}]}},
-            {"data": {"children": [
-                {"kind": "t1", "data": {"author": "a", "body": "b", "score": 1, "replies": {}}},
-            ]}},
+            {
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t1",
+                            "data": {
+                                "author": "a",
+                                "body": "b",
+                                "score": 1,
+                                "replies": {},
+                            },
+                        },
+                    ]
+                }
+            },
         ]
         post, comments, more = parse_detail(data)
         self.assertEqual(post.get("id"), "p1")
@@ -254,6 +278,8 @@ class ParseDetailTest(unittest.TestCase):
             "more_count": 0,
         }
         post, comments, more = parse_detail(data)
+        self.assertEqual(post["title"], "t")
+        self.assertEqual(len(comments), 1)
         self.assertEqual(more, 5)
 
     def test_empty_inputs(self):
@@ -268,13 +294,27 @@ class RenderDetailTest(unittest.TestCase):
     def test_multiline_top_level_comment(self):
         # Top-level append(text) must equal extend(splitlines) once joined:
         # no newline may be lost or merged into one line.
-        env = {"data": {
-            "post": {"id": "x", "subreddit": "s", "title": "t",
-                       "author": "a", "score": 1, "num_comments": 1},
-            "comments": [{"author": "u1", "body": "line1\nline2\n\nline3",
-                            "score": 1, "depth": 0}],
-            "more_count": 0,
-        }}
+        env = {
+            "data": {
+                "post": {
+                    "id": "x",
+                    "subreddit": "s",
+                    "title": "t",
+                    "author": "a",
+                    "score": 1,
+                    "num_comments": 1,
+                },
+                "comments": [
+                    {
+                        "author": "u1",
+                        "body": "line1\nline2\n\nline3",
+                        "score": 1,
+                        "depth": 0,
+                    }
+                ],
+                "more_count": 0,
+            }
+        }
         out = render_detail(env)
         self.assertIn("u/u1 +1: line1", out)
         self.assertIn("\nline2\n\nline3", out)
@@ -283,14 +323,27 @@ class RenderDetailTest(unittest.TestCase):
     def test_multiline_reply_stays_indented(self):
         # Dict-shape replies come from the nested "replies" list
         # (parse_detail forces top-level nodes to depth 0).
-        env = {"data": {
-            "post": {"id": "x", "subreddit": "s", "title": "t",
-                       "author": "a", "score": 1, "num_comments": 2},
-            "comments": [{"author": "u0", "body": "top", "score": 1,
-                            "replies": [{"author": "u1", "body": "a1\na2",
-                                         "score": 1}]}],
-            "more_count": 0,
-        }}
+        env = {
+            "data": {
+                "post": {
+                    "id": "x",
+                    "subreddit": "s",
+                    "title": "t",
+                    "author": "a",
+                    "score": 1,
+                    "num_comments": 2,
+                },
+                "comments": [
+                    {
+                        "author": "u0",
+                        "body": "top",
+                        "score": 1,
+                        "replies": [{"author": "u1", "body": "a1\na2", "score": 1}],
+                    }
+                ],
+                "more_count": 0,
+            }
+        }
         out = render_detail(env)
         self.assertIn("  u/u1 +1: a1", out)
         self.assertIn("\n  a2", out)
@@ -313,10 +366,18 @@ class RegressionTest(unittest.TestCase):
         items, after = _listing_children({"ok": True, "data": None})
         self.assertEqual((items, after), ([], None))
         # Raw null children inside a listing must not crash either.
-        env = {"ok": True, "data": {"data": {"children": [
-            {"kind": "t3", "data": None},
-            {"kind": "t3", "data": {"id": "a1", "title": "t"}},
-        ], "after": None}}}
+        env = {
+            "ok": True,
+            "data": {
+                "data": {
+                    "children": [
+                        {"kind": "t3", "data": None},
+                        {"kind": "t3", "data": {"id": "a1", "title": "t"}},
+                    ],
+                    "after": None,
+                }
+            },
+        }
         items, _ = _listing_children(env)
         self.assertEqual(len(items), 1)
 
@@ -346,7 +407,9 @@ class RegressionTest(unittest.TestCase):
         v = TokenView(["export", "x", "-otips.txt"])
         self.assertIn(v._option_slot(2)[0], {"-o"})
         self.assertEqual(v.value({"-o", "--output"}), "tips.txt")
-        self.assertEqual(TokenView(["cmd", "-rSub"]).value({"-r", "--subreddit"}), "Sub")
+        self.assertEqual(
+            TokenView(["cmd", "-rSub"]).value({"-r", "--subreddit"}), "Sub"
+        )
         self.assertEqual(TokenView(["cmd", "-sTop"]).value({"-s", "--sort"}), "Top")
 
     def test_duplicate_flags_last_wins(self):
@@ -370,13 +433,18 @@ class RegressionTest(unittest.TestCase):
 
     def test_backend_error_passthrough_forwards_stderr(self):
         import subprocess
+
         proc = subprocess.CompletedProcess(
-            args=["rdt", "search"], returncode=1,
-            stdout="not-json\n", stderr="boom-stderr\n")
+            args=["rdt", "search"],
+            returncode=1,
+            stdout="not-json\n",
+            stderr="boom-stderr\n",
+        )
         out_buf, err_buf = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-            with self.assertRaises(SystemExit) as ctx:
-                load_envelope(proc)
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(
+            err_buf
+        ), self.assertRaises(SystemExit) as ctx:
+            load_envelope(proc)
         self.assertEqual(ctx.exception.code, 1)
         self.assertEqual(out_buf.getvalue(), "not-json\n")
         self.assertEqual(err_buf.getvalue(), "boom-stderr\n")
@@ -384,27 +452,70 @@ class RegressionTest(unittest.TestCase):
     def test_raw_nested_depth_comments_and_more(self):
         data = [
             {"data": {"children": [{"data": {"id": "p1", "title": "Post Title"}}]}},
-            {"data": {"children": [
-                {"kind": "t1", "data": {
-                    "id": "c1", "author": "u1", "body": "depth-0", "score": 1,
-                    "replies": {"data": {"children": [
-                        {"kind": "t1", "data": {
-                            "id": "c2", "author": "u2", "body": "depth-1", "score": 1,
-                            "replies": {"data": {"children": [
-                                {"kind": "t1", "data": {
-                                    "id": "c3", "author": "u3", "body": "depth-2", "score": 1,
-                                    "replies": {"data": {"children": [
-                                        {"kind": "more", "data": {"children": ["c4", "c5"]}}
-                                    ]}}
-                                }}
-                            ]}}
-                        }}
-                    ]}}
-                }},
-                {"kind": "more", "data": {"children": ["c6"]}}
-            ]}},
+            {
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t1",
+                            "data": {
+                                "id": "c1",
+                                "author": "u1",
+                                "body": "depth-0",
+                                "score": 1,
+                                "replies": {
+                                    "data": {
+                                        "children": [
+                                            {
+                                                "kind": "t1",
+                                                "data": {
+                                                    "id": "c2",
+                                                    "author": "u2",
+                                                    "body": "depth-1",
+                                                    "score": 1,
+                                                    "replies": {
+                                                        "data": {
+                                                            "children": [
+                                                                {
+                                                                    "kind": "t1",
+                                                                    "data": {
+                                                                        "id": "c3",
+                                                                        "author": "u3",
+                                                                        "body": "depth-2",
+                                                                        "score": 1,
+                                                                        "replies": {
+                                                                            "data": {
+                                                                                "children": [
+                                                                                    {
+                                                                                        "kind": "more",
+                                                                                        "data": {
+                                                                                            "children": [
+                                                                                                "c4",
+                                                                                                "c5",
+                                                                                            ]
+                                                                                        },
+                                                                                    }
+                                                                                ]
+                                                                            }
+                                                                        },
+                                                                    },
+                                                                }
+                                                            ]
+                                                        }
+                                                    },
+                                                },
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                        },
+                        {"kind": "more", "data": {"children": ["c6"]}},
+                    ]
+                }
+            },
         ]
         post, comments, more = parse_detail(data)
+        self.assertEqual(post.get("id"), "p1")
         self.assertEqual(len(comments), 3, f"Expected 3 comments, got {len(comments)}")
         self.assertEqual(comments[0]["depth"], 0)
         self.assertEqual(comments[1]["depth"], 1)
@@ -416,25 +527,37 @@ class RegressionTest(unittest.TestCase):
             "post": {"id": "p1", "title": "Post Title"},
             "comments": [
                 {
-                    "author": "u1", "body": "depth-0", "score": 1,
+                    "author": "u1",
+                    "body": "depth-0",
+                    "score": 1,
                     "replies": [
                         {
-                            "author": "u2", "body": "depth-1", "score": 1,
+                            "author": "u2",
+                            "body": "depth-1",
+                            "score": 1,
                             "replies": [
                                 {
-                                    "author": "u3", "body": "depth-2", "score": 1,
+                                    "author": "u3",
+                                    "body": "depth-2",
+                                    "score": 1,
                                     "replies": [
-                                        {"author": "[more]", "more_count": 2, "more_children": ["x", "y"]}
-                                    ]
+                                        {
+                                            "author": "[more]",
+                                            "more_count": 2,
+                                            "more_children": ["x", "y"],
+                                        }
+                                    ],
                                 }
-                            ]
+                            ],
                         }
-                    ]
+                    ],
                 }
             ],
             "more_count": 1,
         }
         post, comments, more = parse_detail(data)
+        self.assertEqual(len(comments), 3, f"Expected 3 comments, got {len(comments)}")
+        self.assertEqual(post.get("id"), "p1")
         self.assertEqual(len(comments), 3, f"Expected 3 comments, got {len(comments)}")
         self.assertEqual(comments[0]["depth"], 0)
         self.assertEqual(comments[1]["depth"], 1)
@@ -443,52 +566,93 @@ class RegressionTest(unittest.TestCase):
 
     def test_render_detail_is_self_fallback(self):
         # 1. Missing is_self with external URL -> emits LINK
-        env1 = {"data": {
-            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
-                     "permalink": "/r/news/comments/p1/t/"},
-            "comments": [], "more_count": 0,
-        }}
+        env1 = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://example.com/art",
+                    "permalink": "/r/news/comments/p1/t/",
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out1 = render_detail(env1)
         self.assertIn("LINK https://example.com/art", out1)
 
         # 2. is_self is None with external URL -> emits LINK
-        env2 = {"data": {
-            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
-                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
-            "comments": [], "more_count": 0,
-        }}
+        env2 = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://example.com/art",
+                    "permalink": "/r/news/comments/p1/t/",
+                    "is_self": None,
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out2 = render_detail(env2)
         self.assertIn("LINK https://example.com/art", out2)
 
         # 3. is_self is None with url matching permalink -> no LINK
-        env3 = {"data": {
-            "post": {"id": "p1", "title": "t", "url": "https://www.reddit.com/r/news/comments/p1/t/",
-                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
-            "comments": [], "more_count": 0,
-        }}
+        env3 = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://www.reddit.com/r/news/comments/p1/t/",
+                    "permalink": "/r/news/comments/p1/t/",
+                    "is_self": None,
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out3 = render_detail(env3)
         self.assertNotIn("LINK", out3)
 
         # 4. is_self explicitly True -> no LINK even if url is non-empty
-        env4 = {"data": {
-            "post": {"id": "p1", "title": "t", "url": "https://example.com/art",
-                     "permalink": "/r/news/comments/p1/t/", "is_self": True},
-            "comments": [], "more_count": 0,
-        }}
+        env4 = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://example.com/art",
+                    "permalink": "/r/news/comments/p1/t/",
+                    "is_self": True,
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out4 = render_detail(env4)
         self.assertNotIn("LINK", out4)
 
     def test_raw_more_count_and_fallback(self):
         data_count = [
             {"data": {"children": [{"data": {"id": "p1"}}]}},
-            {"data": {"children": [{"kind": "more", "data": {"count": 15, "children": []}}]}},
+            {
+                "data": {
+                    "children": [
+                        {"kind": "more", "data": {"count": 15, "children": []}}
+                    ]
+                }
+            },
         ]
         _, _, more = parse_detail(data_count)
         self.assertEqual(more, 15)
 
         data_children = [
             {"data": {"children": [{"data": {"id": "p1"}}]}},
-            {"data": {"children": [{"kind": "more", "data": {"children": ["c1", "c2"]}}]}},
+            {
+                "data": {
+                    "children": [{"kind": "more", "data": {"children": ["c1", "c2"]}}]
+                }
+            },
         ]
         _, _, more = parse_detail(data_children)
         self.assertEqual(more, 2)
@@ -504,10 +668,20 @@ class RegressionTest(unittest.TestCase):
         data = {
             "post": {"id": "p1"},
             "comments": [
-                {"author": "u1", "body": "b1", "more_count": "invalid", "replies": [
-                    {"author": "u2", "body": "b2", "more_count": "nope", "replies": []},
-                    {"author": "[more]", "more_count": "bad", "more_children": []},
-                ]},
+                {
+                    "author": "u1",
+                    "body": "b1",
+                    "more_count": "invalid",
+                    "replies": [
+                        {
+                            "author": "u2",
+                            "body": "b2",
+                            "more_count": "nope",
+                            "replies": [],
+                        },
+                        {"author": "[more]", "more_count": "bad", "more_children": []},
+                    ],
+                },
                 {"author": "[more]", "more_count": "bad", "more_children": ["c1"]},
             ],
             "more_count": "invalid",
@@ -517,21 +691,35 @@ class RegressionTest(unittest.TestCase):
         self.assertIsInstance(more, int)
 
     def test_render_detail_url_normalization_with_query_params(self):
-        env = {"data": {
-            "post": {"id": "p1", "title": "t",
-                     "url": "https://www.reddit.com/r/news/comments/p1/t/?sort=top&utm_source=share",
-                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
-            "comments": [], "more_count": 0,
-        }}
+        env = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://www.reddit.com/r/news/comments/p1/t/?sort=top&utm_source=share",
+                    "permalink": "/r/news/comments/p1/t/",
+                    "is_self": None,
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out = render_detail(env)
         self.assertNotIn("LINK", out)
 
-        env_ext = {"data": {
-            "post": {"id": "p1", "title": "t",
-                     "url": "https://example.com/art?foo=bar#section",
-                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
-            "comments": [], "more_count": 0,
-        }}
+        env_ext = {
+            "data": {
+                "post": {
+                    "id": "p1",
+                    "title": "t",
+                    "url": "https://example.com/art?foo=bar#section",
+                    "permalink": "/r/news/comments/p1/t/",
+                    "is_self": None,
+                },
+                "comments": [],
+                "more_count": 0,
+            }
+        }
         out_ext = render_detail(env_ext)
         self.assertIn("LINK https://example.com/art?foo=bar#section", out_ext)
 
@@ -555,6 +743,81 @@ class RegressionTest(unittest.TestCase):
         v_limit = _compact_list_view("search", ["--limit", "50"])
         self.assertEqual(v_limit.tokens, ["--limit", "10"])
 
+
+class RunBackendOSErrorTest(unittest.TestCase):
+    """Non-ENOENT OS errors must surface as clean backend errors."""
+
+    @mock.patch.object(_mod.subprocess, "run")
+    def test_permission_denied_becomes_backend_error(self, mock_run):
+        mock_run.side_effect = OSError(13, "Permission denied")
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(
+            io.StringIO()
+        ) as err:
+            _mod.run_backend(["feed"])
+        self.assertEqual(ctx.exception.code, EX_BACKEND)
+        self.assertIn("ERR backend", err.getvalue())
+
+
+class ExportTmpSafetyTest(unittest.TestCase):
+    """A planted `{outfile}.tmp` (file or link) must not hijack the export."""
+
+    def _run_export(self, out):
+        proc = mock.Mock()
+        proc.returncode = 0
+        with mock.patch.object(_mod, "run_backend", return_value=proc):
+            return _mod.cmd_export_compact(["-o", out])
+
+    def _write_valid_csv(self, out):
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            f.write("score,num_comments,subreddit,title,author,url\n" "1,2,s,t,a,u\n")
+
+    def test_preplanted_tmp_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "ex.csv")
+            with open(out + ".tmp", "w", encoding="utf-8") as f:
+                f.write("stale")
+            self._write_valid_csv(out)
+            rc = self._run_export(out)
+            self.assertEqual(rc, EX_OK)
+            with open(out + ".tmp", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "stale")
+            with open(out, encoding="utf-8") as f:
+                content = f.read()
+            self.assertTrue(
+                content.startswith("score | sub | title | author | url\n"), content
+            )
+            self.assertIn("u/a", content)
+
+    def test_symlink_tmp_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "ex.csv")
+            victim = os.path.join(tmp, "victim.txt")
+            with open(victim, "w", encoding="utf-8") as f:
+                f.write("untouched")
+            os.symlink(victim, out + ".tmp")
+            self._write_valid_csv(out)
+            rc = self._run_export(out)
+            self.assertEqual(rc, EX_OK)
+            self.assertTrue(os.path.islink(out + ".tmp"))
+            with open(victim, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "untouched")
+
+
+class ExportMalformedCsvTest(unittest.TestCase):
+    """Oversized backend CSV cells must be a controlled error, not a traceback."""
+
+    @mock.patch.object(_mod, "run_backend")
+    def test_oversized_cell_is_controlled_error(self, mock_run):
+        mock_run.return_value.returncode = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.csv")
+            with open(out, "w", encoding="utf-8", newline="") as f:
+                f.write("score,num_comments,subreddit,title,author,url\n")
+                f.write("1,2,s," + "t" * 200000 + ",a,u\n")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = _mod.cmd_export_compact(["-o", out])
+            self.assertEqual(rc, EX_BACKEND)
+            self.assertIn("ERR io", err.getvalue())
 
 
 if __name__ == "__main__":
