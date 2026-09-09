@@ -30,6 +30,11 @@ post_line = _mod.post_line
 load_envelope = _mod.load_envelope
 LISTING_HEADER = _mod.LISTING_HEADER
 EXPORT_CAP_N = _mod.EXPORT_CAP_N
+_comment_cells = _mod._comment_cells
+_raw_comment_of = _mod._raw_comment_of
+render_user = _mod.render_user
+_compact_list_view = _mod._compact_list_view
+LIMIT_FLAGS = _mod.LIMIT_FLAGS
 
 
 class TokenViewTest(unittest.TestCase):
@@ -239,6 +244,17 @@ class ParseDetailTest(unittest.TestCase):
         parse_detail(dict_data)
         post, comments, more = parse_detail([])
         self.assertEqual((post, comments, more), ({}, [], 0))
+
+    def test_top_level_comment_more_count(self):
+        data = {
+            "post": {"id": "p1", "title": "t"},
+            "comments": [
+                {"author": "u1", "body": "c1", "more_count": 5, "replies": []}
+            ],
+            "more_count": 0,
+        }
+        post, comments, more = parse_detail(data)
+        self.assertEqual(more, 5)
 
     def test_empty_inputs(self):
         self.assertEqual(parse_detail({}), ({}, [], 0))
@@ -461,6 +477,83 @@ class RegressionTest(unittest.TestCase):
         }}
         out4 = render_detail(env4)
         self.assertNotIn("LINK", out4)
+
+    def test_raw_more_count_and_fallback(self):
+        data_count = [
+            {"data": {"children": [{"data": {"id": "p1"}}]}},
+            {"data": {"children": [{"kind": "more", "data": {"count": 15, "children": []}}]}},
+        ]
+        _, _, more = parse_detail(data_count)
+        self.assertEqual(more, 15)
+
+        data_children = [
+            {"data": {"children": [{"data": {"id": "p1"}}]}},
+            {"data": {"children": [{"kind": "more", "data": {"children": ["c1", "c2"]}}]}},
+        ]
+        _, _, more = parse_detail(data_children)
+        self.assertEqual(more, 2)
+
+        data_empty = [
+            {"data": {"children": [{"data": {"id": "p1"}}]}},
+            {"data": {"children": [{"kind": "more", "data": {}}]}},
+        ]
+        _, _, more = parse_detail(data_empty)
+        self.assertEqual(more, 1)
+
+    def test_more_count_safe_integer_conversion(self):
+        data = {
+            "post": {"id": "p1"},
+            "comments": [
+                {"author": "u1", "body": "b1", "more_count": "invalid", "replies": [
+                    {"author": "u2", "body": "b2", "more_count": "nope", "replies": []},
+                    {"author": "[more]", "more_count": "bad", "more_children": []},
+                ]},
+                {"author": "[more]", "more_count": "bad", "more_children": ["c1"]},
+            ],
+            "more_count": "invalid",
+        }
+        _, comments, more = parse_detail(data)
+        self.assertEqual(len(comments), 2)
+        self.assertIsInstance(more, int)
+
+    def test_render_detail_url_normalization_with_query_params(self):
+        env = {"data": {
+            "post": {"id": "p1", "title": "t",
+                     "url": "https://www.reddit.com/r/news/comments/p1/t/?sort=top&utm_source=share",
+                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
+            "comments": [], "more_count": 0,
+        }}
+        out = render_detail(env)
+        self.assertNotIn("LINK", out)
+
+        env_ext = {"data": {
+            "post": {"id": "p1", "title": "t",
+                     "url": "https://example.com/art?foo=bar#section",
+                     "permalink": "/r/news/comments/p1/t/", "is_self": None},
+            "comments": [], "more_count": 0,
+        }}
+        out_ext = render_detail(env_ext)
+        self.assertIn("LINK https://example.com/art?foo=bar#section", out_ext)
+
+    def test_null_author_and_subreddit_safe_fallback(self):
+        cells = _comment_cells(1, {"author": None, "subreddit": None})
+        self.assertEqual(cells["author"], "u/?")
+        self.assertEqual(cells["sub"], "r/?")
+
+        raw = _raw_comment_of({"author": None})
+        self.assertEqual(raw["author"], "?")
+
+        user_out = render_user({"data": {"name": None}})
+        self.assertTrue(user_out.startswith("u/?"))
+
+    def test_consistent_limit_and_count_flags(self):
+        self.assertEqual(LIMIT_FLAGS, {"-n", "--limit", "--count"})
+
+        v_count = _compact_list_view("sub", ["--count", "50"])
+        self.assertEqual(v_count.tokens, ["--count", "10"])
+
+        v_limit = _compact_list_view("search", ["--limit", "50"])
+        self.assertEqual(v_limit.tokens, ["--limit", "10"])
 
 
 

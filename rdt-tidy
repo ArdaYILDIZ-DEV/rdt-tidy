@@ -28,6 +28,7 @@ LIST_CAP_N = 10
 SUBS_CAP_N = 5
 SUBS_CAP_SUBS = 5
 EXPORT_CAP_N = 50
+LIMIT_FLAGS = {"-n", "--limit", "--count"}
 
 # Compact table headers (contract).
 LISTING_HEADER = "no | score | sub | title | author | id"
@@ -94,23 +95,30 @@ Compact mode rules (summary):
 
 
 def find_rdt() -> str:
+    """Locate the rdt executable on PATH or under ~/.local/bin."""
     found = shutil.which("rdt")
     if found:
         return found
     cand = os.path.expanduser("~/.local/bin/rdt")
-    if os.path.exists(cand):
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
         return cand
     return "rdt"
 
 
 def squish(text: object) -> str:
+    """Collapse internal whitespace into single spaces and strip edges."""
     return " ".join(str(text).split())
 
 
 def flow(text: object) -> str:
     """Collapse inline whitespace, keep line breaks and paragraphs."""
+    if not text:
+        return ""
+    raw = str(text)
+    if not raw.strip():
+        return ""
     out: list[str] = []
-    for line in str(text).splitlines():
+    for line in raw.splitlines():
         squeezed = " ".join(line.split())
         if squeezed:
             out.append(squeezed)
@@ -123,7 +131,7 @@ def flow(text: object) -> str:
 
 def fmt_date(ts: object) -> str:
     try:
-        num = float(ts)  # type: ignore[arg-type]
+        num = float(ts)  # type: ignore[arg-type] - ts is untyped object; float parses int/str/float.
     except (TypeError, ValueError, OverflowError):
         return "-"
     if not num:
@@ -241,44 +249,38 @@ class TokenView:
         """Inspects token at index i.
         Returns: (option_name, extracted_value, value_token_index_if_separate)
         """
-        if i < 0 or i >= len(self.tokens):
-            return (None, None, None)
-        if self.kinds[i] != "f":
+        if i < 0 or i >= len(self.tokens) or self.kinds[i] != "f":
             return (None, None, None)
         t = self.tokens[i]
         if t == "--":
             return (None, None, None)
+
+        def _follow_val(flag_name: str) -> tuple[str, str | None, int | None]:
+            if i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
+                return (flag_name, self.tokens[i + 1], i + 1)
+            return (flag_name, None, None)
+
         if t.startswith("--"):
             name, sep, val = t.partition("=")
-            if sep:
-                return (name, val, None)
-            if i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
-                return (name, self.tokens[i + 1], i + 1)
-            return (name, None, None)
-        # Single-dash short options.
+            return (name, val, None) if sep else _follow_val(name)
+
+        # Single-dash short options (-n, -o).
         if len(t) == 2:
-            if i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
-                return (t, self.tokens[i + 1], i + 1)
-            return (t, None, None)
-        if len(t) > 2:
-            prefix = t[:2]
-            rest = t[2:].lstrip("=")
-            # Packed only for value-taking short options; numeric `-n`
-            # requires a numeric remainder so `-nonsense` stays whole.
-            if prefix in VALUE_OPTS and rest:
-                if prefix == "-n":
-                    try:
-                        int(rest)
-                        return (prefix, rest, None)
-                    except ValueError:
-                        pass
-                else:
-                    return (prefix, rest, None)
-            # Not packed: whole token is the flag name.
-            if i + 1 < len(self.tokens) and self.kinds[i + 1] == "v":
-                return (t, self.tokens[i + 1], i + 1)
-            return (t, None, None)
-        return (None, None, None)
+            return _follow_val(t)
+
+        # Multi-character single-dash options (e.g. packed -n10, -ofile.txt, or -flag).
+        prefix = t[:2]
+        rest = t[2:].lstrip("=")
+        if prefix in VALUE_OPTS and rest:
+            if prefix != "-n":
+                return (prefix, rest, None)
+            try:
+                int(rest)
+                return (prefix, rest, None)
+            except ValueError:
+                pass
+
+        return _follow_val(t)
 
     def indices(self, names: set[str]) -> list[int]:
         """Indices of matching flags (packed short forms included)."""
@@ -286,16 +288,18 @@ class TokenView:
                 if (self._option_slot(i)[0] in names)]
 
     def has(self, names: set[str]) -> bool:
-        return bool(self.indices(names))
+        for i in range(len(self.tokens)):
+            if self._option_slot(i)[0] in names:
+                return True
+        return False
 
     def value(self, names: set[str]) -> str | None:
         # Last-occurrence wins (Click/POSIX convention).
-        result: str | None = None
-        for i in self.indices(names):
-            val = self._option_slot(i)[1]
-            if val is not None:
-                result = val
-        return result
+        for i in range(len(self.tokens) - 1, -1, -1):
+            name, val, _ = self._option_slot(i)
+            if name in names and val is not None:
+                return val
+        return None
 
     def cap(self, names: set[str], cap: int) -> TokenView:
         """Clamp option values to the cap; kinds are unchanged."""
@@ -318,8 +322,8 @@ class TokenView:
 
     def _insertion_point(self) -> int:
         """Index before the first `--` separator, or end when absent."""
-        for i, (t, k) in enumerate(zip(self.tokens, self.kinds)):
-            if t == "--" and k == "f":
+        for i, t in enumerate(self.tokens):
+            if t == "--" and self.kinds[i] == "f":
                 return i
         return len(self.tokens)
 
@@ -387,6 +391,7 @@ def run_backend(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
+    """Parse JSON stdout or pass through raw backend stream on failure."""
     if not proc.stdout.strip():
         detail = squish(proc.stderr) or "empty output"
         print(f"ERR backend: {detail}")
@@ -402,6 +407,7 @@ def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
 
 
 def check_error(env: object) -> None:
+    """Exit with formatted ERR if the response envelope flags an error."""
     if isinstance(env, dict) and not env.get("ok", True):
         err = env.get("error")
         if isinstance(err, str):
@@ -429,14 +435,14 @@ def _envelope_data(env: object) -> dict:
 def _child_kind_body(child: object) -> tuple[str, dict]:
     if isinstance(child, dict):
         data = child.get("data", child)
-        kind = str(child.get("kind", "t3"))
+        kind = str(child.get("kind") or "t3")
         return kind, data if isinstance(data, dict) else {}
     return "t3", {}
 
 
 def _inum(value: object) -> int:
     try:
-        return int(float(value))  # type: ignore[arg-type]
+        return int(float(value))  # type: ignore[arg-type] - value is untyped object; guarded by except.
     except (TypeError, ValueError, OverflowError):
         return 0
 
@@ -445,17 +451,26 @@ def _signed(value: object) -> str:
     return f"{_inum(value):+d}"
 
 
+def _user_tag(name: object) -> str:
+    return f"u/{name or '?'}"
+
+
+def _sub_tag(name: object) -> str:
+    return f"r/{name or '?'}"
+
+
+def _score_comments_badge(score: object, num_comments: object) -> str:
+    return f"{_signed(score)}c{_inum(num_comments)}"
+
+
 def _post_cells(num: int, d: dict) -> dict[str, str]:
     """Structured post fields; caller projects by header order."""
-    sub_raw = d.get("subreddit") or "?"
-    title = squish(d.get("title", "-") or "-")
-    author = d.get("author", "?") or "?"
     return {
         "no": str(num),
-        "score": f"{_signed(d.get('score', 0))}c{_inum(d.get('num_comments', 0))}",
-        "sub": f"r/{sub_raw}",
-        "title": title,
-        "author": f"u/{author}",
+        "score": _score_comments_badge(d.get("score", 0), d.get("num_comments", 0)),
+        "sub": _sub_tag(d.get("subreddit")),
+        "title": squish(d.get("title", "-") or "-"),
+        "author": _user_tag(d.get("author")),
         "id": f"{d.get('id', '')}",
     }
 
@@ -465,27 +480,32 @@ def _project(row: dict[str, str], order: list[str]) -> str:
     return " | ".join(row[k] for k in order)
 
 
+POST_COLS_SUB = ["no", "score", "sub", "title", "author", "id"]
+POST_COLS_NO_SUB = ["no", "score", "title", "author", "id"]
+COMMENT_COLS = ["no", "author", "score", "sub", "body", "id"]
+MIXED_COMMENT_COLS = ["kind", "no", "score", "sub", "body", "author", "id"]
+MIXED_POST_COLS = ["kind", "no", "score", "sub", "title", "author", "id"]
+
+
 def post_line(num: int, d: dict, show_sub: bool) -> str:
     row = _post_cells(num, d)
-    if show_sub:
-        return _project(row, ["no", "score", "sub", "title", "author", "id"])
-    return _project(row, ["no", "score", "title", "author", "id"])
+    return _project(row, POST_COLS_SUB if show_sub else POST_COLS_NO_SUB)
 
 
 def _comment_cells(num: int, d: dict) -> dict[str, str]:
     """Structured comment fields; caller projects by header order."""
     return {
         "no": str(num),
-        "author": f"u/{d.get('author', '?')}",
+        "author": _user_tag(d.get("author")),
         "score": _signed(d.get("score", 0)),
-        "sub": f"r/{d.get('subreddit', '?')}",
+        "sub": _sub_tag(d.get("subreddit")),
         "body": squish(d.get("body", "")),
         "id": f"{d.get('id', '')}",
     }
 
 
 def comment_line(num: int, d: dict) -> str:
-    return _project(_comment_cells(num, d), ["no", "author", "score", "sub", "body", "id"])
+    return _project(_comment_cells(num, d), COMMENT_COLS)
 
 
 def _listing_children(env: object) -> tuple[list[tuple[str, dict]], object]:
@@ -542,12 +562,10 @@ def render_mixed(env: object) -> str:
     for num, (kind, d) in enumerate(items, 1):
         if kind == "t1":
             row = _comment_cells(num, d)
-            lines.append(_project({**row, "kind": "C"},
-                                  ["kind", "no", "score", "sub", "body", "author", "id"]))
+            lines.append(_project({**row, "kind": "C"}, MIXED_COMMENT_COLS))
         else:
             row = _post_cells(num, d)
-            lines.append(_project({**row, "kind": "P"},
-                                  ["kind", "no", "score", "sub", "title", "author", "id"]))
+            lines.append(_project({**row, "kind": "P"}, MIXED_POST_COLS))
     if after:
         lines.append(f"next {after}")
     return "\n".join(lines)
@@ -564,7 +582,7 @@ def _typed_replies(node: dict) -> list[dict]:
         if rep.get("author") == "[more]" or rep.get("kind") == "more":
             continue
         out.append({
-            "author": rep.get("author", "?"),
+            "author": rep.get("author") or "?",
             "body": rep.get("body", ""),
             "score": rep.get("score", 0),
             "depth": 1,
@@ -579,16 +597,16 @@ def _typed_more(node: dict) -> int:
         if not isinstance(rep, dict):
             continue
         if rep.get("author") == "[more]" or rep.get("kind") == "more":
-            more += int(rep.get("more_count") or len(rep.get("more_children", []) or []) or 1)
+            more += _inum(rep.get("more_count")) or len(rep.get("more_children", []) or []) or 1
         else:
-            more += int(rep.get("more_count") or 0) + _typed_more(rep)
+            more += _inum(rep.get("more_count")) + _typed_more(rep)
     return more
 
 
 def _raw_comment_of(d: dict, depth: int = 0) -> dict:
     """Reduce raw t1 data to a compact comment (0 top-level, 1 reply)."""
     return {
-        "author": d.get("author", "?"),
+        "author": d.get("author") or "?",
         "body": d.get("body", ""),
         "score": d.get("score", 0),
         "depth": min(depth, 1),
@@ -600,7 +618,8 @@ def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> in
     if not isinstance(child, dict):
         return 0
     if child.get("kind") == "more":
-        return len((child.get("data") or {}).get("children", []) or [])
+        d = child.get("data") if isinstance(child.get("data"), dict) else {}
+        return _inum(d.get("count")) or len(d.get("children", []) or []) or 1
     if child.get("kind") != "t1":
         return 0
     d = child.get("data") or {}
@@ -611,9 +630,9 @@ def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> in
     replies = d.get("replies")
     if isinstance(replies, dict):
         rdata = replies.get("data")
-        if isinstance(rdata, dict):
-            for rchild in rdata.get("children") or []:
-                more += _absorb_raw_child(rchild, comments, depth=1)
+        rchildren = rdata.get("children") if isinstance(rdata, dict) else []
+        for rchild in rchildren or []:
+            more += _absorb_raw_child(rchild, comments, depth=1)
     return more
 
 
@@ -622,15 +641,15 @@ def _parse_typed_detail(data: dict) -> tuple[dict, list[dict], int]:
     raw_post = data.get("post") or {}
     post = raw_post if isinstance(raw_post, dict) else {}
     comments: list[dict] = []
-    more = int(data.get("more_count") or 0)
+    more = _inum(data.get("more_count"))
     for node in data.get("comments") or []:
         if not isinstance(node, dict):
             continue
         if node.get("author") == "[more]" or node.get("kind") == "more":
-            more += int(node.get("more_count") or len(node.get("more_children", []) or []) or 1)
+            more += _inum(node.get("more_count")) or len(node.get("more_children", []) or []) or 1
             continue
         comments.append({**node, "depth": 0})
-        more += _typed_more(node)
+        more += _inum(node.get("more_count")) + _typed_more(node)
         comments.extend(_typed_replies(node))
     return post, comments, more
 
@@ -665,6 +684,7 @@ def parse_detail(data: object) -> tuple[dict, list[dict], int]:
 
 
 def render_detail(env: object) -> str:
+    """Format post header, external link, body, and comment hierarchy."""
     if isinstance(env, dict):
         raw = env.get("data")
         data = raw if isinstance(raw, (dict, list)) else {}
@@ -673,14 +693,16 @@ def render_detail(env: object) -> str:
     post, comments, more = parse_detail(data)
     pid = post.get("id", "?")
     lines = [
-        f"# {pid} r/{post.get('subreddit', '?')} | {squish(post.get('title', '-') or '-')} "
-        f"| u/{post.get('author', '?')} {_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c)"
+        f"# {pid} {_sub_tag(post.get('subreddit'))} | {squish(post.get('title', '-') or '-')} "
+        f"| {_user_tag(post.get('author'))} {_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c)"
     ]
     url = str(post.get("url", "") or "")
     is_self = post.get("is_self")
     if is_self is None:
         permalink = str(post.get("permalink", "") or "")
-        is_link = bool(url and url != permalink and not (permalink and url.endswith(permalink)))
+        clean_url = url.split("?")[0].split("#")[0]
+        clean_permalink = permalink.split("?")[0].split("#")[0]
+        is_link = bool(url and url != permalink and not (clean_permalink and clean_url.endswith(clean_permalink)))
     else:
         is_link = bool(url and not is_self)
     if is_link:
@@ -691,7 +713,7 @@ def render_detail(env: object) -> str:
     if comments:
         lines.append("---")
         for c in comments:
-            text = f"u/{c.get('author', '?')} {_signed(c.get('score', 0))}: {flow(c.get('body', ''))}"
+            text = f"{_user_tag(c.get('author'))} {_signed(c.get('score', 0))}: {flow(c.get('body', ''))}"
             if c.get("depth", 0):
                 lines.extend(f"  {ln}" if ln else ln for ln in text.splitlines())
             else:
@@ -705,10 +727,11 @@ def render_detail(env: object) -> str:
 
 
 def render_subinfo(env: object) -> str:
+    """Format subreddit metadata into subscriber, age, and description lines."""
     data = _envelope_data(env)
     if not isinstance(data, dict):
         return ""
-    name = data.get("display_name_prefixed") or f"r/{data.get('display_name', '?')}"
+    name = data.get("display_name_prefixed") or _sub_tag(data.get("display_name"))
     lines = [
         f"{name} {data.get('subscribers', 0)} subs {data.get('accounts_active', 0)} online",
         f"created {fmt_date(data.get('created_utc', 0))}"
@@ -721,16 +744,18 @@ def render_subinfo(env: object) -> str:
 
 
 def render_user(env: object) -> str:
+    """Format user karma and account age into a single summary line."""
     data = _envelope_data(env)
     if not isinstance(data, dict):
         return ""
     return (
-        f"u/{data.get('name', '?')} post:{data.get('link_karma', 0)} "
+        f"{_user_tag(data.get('name'))} post:{data.get('link_karma', 0)} "
         f"comment:{data.get('comment_karma', 0)} age:{fmt_date(data.get('created_utc', 0))}"
     )
 
 
 def render_whoami(env: object) -> str:
+    """Format current authenticated user identity and session capabilities."""
     first = render_user(env)
     data = _envelope_data(env)
     sess = data.get("_session") or {} if isinstance(data, dict) else {}
@@ -762,12 +787,12 @@ INFO_RENDERERS: dict[str, Callable[[object], str]] = {
 def _compact_list_view(cmd: str, rest: list[str]) -> TokenView:
     """Shared limit policy for listing commands (clamp plus default)."""
     view = TokenView(rest)
-    view.cap({"-n", "--limit"}, LIST_CAP_N)
+    view.cap(LIMIT_FLAGS, LIST_CAP_N)
     if cmd == "feed" and view.has({"--subs-only"}):
         view.cap({"--max-subs"}, SUBS_CAP_SUBS)
-        view.cap({"-n", "--limit"}, SUBS_CAP_N)
+        view.cap(LIMIT_FLAGS, SUBS_CAP_N)
         view.ensure("--max-subs", str(SUBS_CAP_SUBS), {"--max-subs"})
-    view.ensure("-n", str(LIST_DEFAULT_N), {"-n", "--limit"})
+    view.ensure("-n", str(LIST_DEFAULT_N), LIMIT_FLAGS)
     return view
 
 
@@ -811,22 +836,23 @@ def cmd_detail(cmd: str, rest: list[str]) -> int:
 def _export_line(row: dict) -> str:
     """Convert a CSV row into a short export line."""
     return " | ".join([
-        f"{_signed(_inum(row.get('score', 0)))}c{_inum(row.get('num_comments', 0))}",
-        f"r/{row.get('subreddit', '?')}",
+        _score_comments_badge(row.get("score", 0), row.get("num_comments", 0)),
+        _sub_tag(row.get("subreddit")),
         squish(row.get("title", "")),
-        f"u/{row.get('author', '?')}",
+        _user_tag(row.get("author")),
         f"{row.get('url', '')}",
     ])
 
 
 def cmd_export_compact(rest: list[str]) -> int:
+    """Fetch backend CSV export and rewrite it atomically to compact rows."""
     view = TokenView(rest)
     outfile = view.value({"-o", "--output"})
     if not outfile:
         print("ERR usage: export --compact requires a file (-o FILE)", file=sys.stderr)
         return EX_USAGE
-    view.cap({"-n", "--count"}, EXPORT_CAP_N)
-    view.ensure("-n", str(EXPORT_CAP_N), {"-n", "--count"})
+    view.cap(LIMIT_FLAGS, EXPORT_CAP_N)
+    view.ensure("-n", str(EXPORT_CAP_N), LIMIT_FLAGS)
     # Readable CSV as the intermediate format, then shrink to short lines.
     view.drop(TIDY_FLAGS | {"--yaml"})
     view.remove({"--format"})
@@ -876,6 +902,7 @@ def cmd_passthrough(cmd: str, rest: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    """Route CLI arguments between passthrough and compact command handlers."""
     # Mode flags are recognized only before the command; later -c/--compact
     # belongs to rdt and positional text is left alone.
     compact = False

@@ -364,4 +364,45 @@ with tempfile.TemporaryDirectory() as tmp:
     check("export strips --yaml", "--yaml" not in argv, repr(argv))
     check("export format csv", "--format" in argv and "csv" in argv, repr(argv))
 
+    # 35. Listing clamps --count 50 to 10
+    open(log, "w").close()
+    p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_ARGV_LOG": log},
+            "--compact", "search", "x", "--count", "50")
+    argv = json.loads(open(log, encoding="utf-8").read().strip().splitlines()[-1])
+    check("count clamped to 10", "--count" in argv and "10" in argv and "-n" not in argv, repr(argv))
+
+    # 36. Read with self post containing query params doesn't emit LINK
+    self_post_query = os.path.join(tmp, "self_query.json")
+    open(self_post_query, "w", encoding="utf-8").write(json.dumps({
+        "ok": True, "data": {
+            "post": {
+                "id": "sq1", "title": "Self Query", "subreddit": "test",
+                "author": "tester", "score": 5, "num_comments": 0,
+                "url": "https://www.reddit.com/r/test/comments/sq1/self_query/?utm_source=share",
+                "permalink": "/r/test/comments/sq1/self_query/",
+                "is_self": None,
+            },
+            "comments": [], "more_count": 0,
+        }
+    }))
+    p = run({"RDT_FIXTURE": self_post_query}, "--compact", "read", "sq1")
+    check("read self post query params no link", "LINK" not in p.stdout, repr(p.stdout))
+
+    # 37. Read with null author in comment emits u/?
+    null_author_comment = os.path.join(tmp, "null_author.json")
+    open(null_author_comment, "w", encoding="utf-8").write(json.dumps({
+        "ok": True, "data": {
+            "post": {
+                "id": "na1", "title": "Null Author", "subreddit": "test",
+                "author": "tester", "score": 5, "num_comments": 1,
+            },
+            "comments": [
+                {"author": None, "body": "null author body", "score": 2, "depth": 0}
+            ],
+            "more_count": 0,
+        }
+    }))
+    p = run({"RDT_FIXTURE": null_author_comment}, "--compact", "read", "na1")
+    check("read null author emits u/?", "u/? +2: null author body" in p.stdout, repr(p.stdout))
+
 print(f"\n{PASS} tests passed")
