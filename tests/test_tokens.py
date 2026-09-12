@@ -39,6 +39,7 @@ EXPORT_CAP_N = _mod.EXPORT_CAP_N
 _comment_cells = _mod._comment_cells
 _raw_comment_of = _mod._raw_comment_of
 render_user = _mod.render_user
+render_status = _mod.render_status
 _compact_list_view = _mod._compact_list_view
 LIMIT_FLAGS = _mod.LIMIT_FLAGS
 
@@ -172,6 +173,18 @@ class CheckErrorTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             check_error({"ok": True, "data": {}})
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_error_key_without_ok_triggers_error(self):
+        code, out = self._run({"error": {"code": "gone", "message": "deleted"}})
+        self.assertEqual(code, EX_BACKEND)
+        self.assertEqual(out.strip(), "ERR gone: deleted")
+
+    def test_error_key_with_ok_true_is_silent(self):
+        # Explicit ok:true overrides the error key presence heuristic.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            check_error({"ok": True, "error": {"code": "x", "message": "y"}})
         self.assertEqual(buf.getvalue(), "")
 
 
@@ -814,10 +827,236 @@ class ExportMalformedCsvTest(unittest.TestCase):
             with open(out, "w", encoding="utf-8", newline="") as f:
                 f.write("score,num_comments,subreddit,title,author,url\n")
                 f.write("1,2,s," + "t" * 200000 + ",a,u\n")
-            with contextlib.redirect_stderr(io.StringIO()) as err:
+            with contextlib.redirect_stdout(io.StringIO()) as cap:
                 rc = _mod.cmd_export_compact(["-o", out])
             self.assertEqual(rc, EX_BACKEND)
-            self.assertIn("ERR io", err.getvalue())
+            self.assertIn("ERR io", cap.getvalue())
+
+
+class PipeEscapeTest(unittest.TestCase):
+    """A literal '|' in cell text must escape as '\\|' (single-line tables)."""
+
+    def test_safe_cell_escapes_pipe(self):
+        self.assertEqual(_mod._safe_cell("a|b"), r"a\|b")
+        self.assertEqual(_mod._safe_cell("a | b"), r"a \| b")
+
+    def test_post_title_pipe_escaped(self):
+        d = {
+            "id": "x1",
+            "title": "a|b",
+            "subreddit": "s",
+            "author": "u1",
+            "score": 1,
+            "num_comments": 2,
+        }
+        line = _mod.post_line(1, d, True)
+        self.assertIn(r"a\|b", line)
+        self.assertEqual(line.count(" | "), 5)
+
+    def test_comment_body_pipe_escaped(self):
+        line = _mod.comment_line(
+            1,
+            {"id": "k1", "author": "u1", "score": 1, "subreddit": "s", "body": "x|y"},
+        )
+        self.assertIn(r"x\|y", line)
+
+    def test_export_title_pipe_escaped(self):
+        line = _mod._export_line(
+            {"score": 1, "num_comments": 2, "subreddit": "s", "title": "p|q", "author": "a", "url": "u"}
+        )
+        self.assertIn(r"p\|q", line)
+
+
+class StatusRenderTest(unittest.TestCase):
+    """Compact status stays one line and never leaks local paths."""
+
+    def test_authenticated_shape(self):
+        env = {
+            "ok": True,
+            "data": {
+                "authenticated": True,
+                "username": "spez",
+                "capabilities": ["read", "write"],
+                "modhash_present": True,
+                "credential_file": "/home/user/.config/rdt-cli/credential.json",
+                "cookie_count": 10,
+            },
+        }
+        out = render_status(env)
+        self.assertEqual(out, "auth:yes u/spez caps:read,write modhash:1")
+        self.assertNotIn("credential", out)
+        self.assertNotIn("/home/", out)
+        self.assertNotIn("cookie", out)
+        self.assertEqual(len(out.splitlines()), 1)
+
+    def test_anonymous_shape(self):
+        out = render_status({"ok": True, "data": {"authenticated": False}})
+        self.assertEqual(out, "auth:no")
+
+    def test_anonymous_error_suffix(self):
+        out = render_status(
+            {"ok": True, "data": {"authenticated": False, "error": "expired"}}
+        )
+        self.assertEqual(out, "auth:no expired")
+
+    def test_missing_username_and_caps(self):
+        out = render_status({"ok": True, "data": {"authenticated": True}})
+        self.assertEqual(out, "auth:yes u/? caps:- modhash:0")
+
+
+class BackendTimeoutTest(unittest.TestCase):
+    """RDT_TIDY_TIMEOUT overrides the default 30 s within 1..300."""
+
+    def test_default_is_30(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_mod.BACKEND_TIMEOUT_ENV, None)
+            self.assertEqual(_mod.backend_timeout(), 30)
+
+    def test_custom_value(self):
+        with mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: "5"}):
+            self.assertEqual(_mod.backend_timeout(), 5)
+
+    def test_invalid_falls_back(self):
+        for bad in ("nonsense", "0", "-3", "9999", ""):
+            with mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: bad}):
+                self.assertEqual(_mod.backend_timeout(), 30, bad)
+
+    @mock.patch.object(_mod.subprocess, "run")
+    def test_run_backend_uses_configured_timeout(self, mock_run):
+        mock_run.return_value = mock.Mock(stdout="{}", stderr="", returncode=0)
+        with mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: "7"}):
+            _mod.run_backend(["status"])
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs.get("timeout"), 7)
+
+    @mock.patch.object(_mod.subprocess, "run")
+    def test_timeout_message_reports_configured_seconds(self, mock_run):
+        mock_run.side_effect = _mod.subprocess.TimeoutExpired(cmd="rdt", timeout=9)
+        with mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: "9"}):
+            with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(
+                io.StringIO()
+            ) as err:
+                _mod.run_backend(["status"])
+        self.assertEqual(ctx.exception.code, _mod.EX_BACKEND)
+        self.assertIn("within 9s", err.getvalue())
+
+
+class EnvelopeSizeGuardTest(unittest.TestCase):
+    """Oversized backend payloads fail closed instead of exhausting memory."""
+
+    def test_normal_payload_parses(self):
+        proc = mock.Mock(stdout='{"ok": true}', stderr="", returncode=0)
+        self.assertEqual(_mod.load_envelope(proc), {"ok": True})
+
+    def test_oversized_payload_is_controlled_error(self):
+        big = "x" * (_mod.MAX_BACKEND_BYTES + 1)
+        proc = mock.Mock(stdout=big, stderr="", returncode=0)
+        with contextlib.redirect_stdout(io.StringIO()) as cap:
+            with self.assertRaises(SystemExit) as ctx:
+                _mod.load_envelope(proc)
+        self.assertEqual(ctx.exception.code, _mod.EX_BACKEND)
+        self.assertIn("response too large", cap.getvalue())
+
+
+class CapsHelperTest(unittest.TestCase):
+    """Shared caps/modhash formatting stays identical for whoami/status."""
+
+    def test_caps_str(self):
+        self.assertEqual(_mod._caps_str(["read", "write"]), "read,write")
+        self.assertEqual(_mod._caps_str(("a", "", None)), "a")
+        self.assertEqual(_mod._caps_str([]), "-")
+        self.assertEqual(_mod._caps_str(None), "-")
+        self.assertEqual(_mod._caps_str("read"), "read")
+
+    def test_mod_flag(self):
+        self.assertEqual(_mod._mod_flag(True), 1)
+        self.assertEqual(_mod._mod_flag(False), 0)
+        self.assertEqual(_mod._mod_flag(None), 0)
+
+    def test_whoami_uses_helper(self):
+        env = {
+            "ok": True,
+            "data": {
+                "name": "spez",
+                "link_karma": 1,
+                "comment_karma": 2,
+                "created_utc": 1126550000,
+                "_session": {"capabilities": [], "modhash_present": False},
+            },
+        }
+        self.assertTrue(_mod.render_whoami(env).endswith("sess - modhash:0"))
+
+
+class WhitespacePolicyTest(unittest.TestCase):
+    """squish vs _safe_cell vs flow each keep their documented contract."""
+
+    def test_matrix(self):
+        self.assertEqual(_mod.squish("a  b\n c"), "a b c")
+        self.assertEqual(_mod._safe_cell("a|b"), r"a\|b")
+        self.assertEqual(_mod.flow("a  b\n\n c"), "a b\n\nc")
+        self.assertEqual(_mod.flow(""), "")
+        self.assertEqual(_mod.flow("   "), "")
+
+
+class ExportSchemaTest(unittest.TestCase):
+    """Lenient CSV parsing: missing columns default, extras are ignored."""
+
+    def test_missing_columns_default(self):
+        line = _mod._export_line({})
+        self.assertIn("u/?", line)
+        self.assertTrue(line.startswith("+0c0 | r/? |  | u/? | "))
+
+    def test_extra_columns_ignored(self):
+        line = _mod._export_line(
+            {
+                "score": 3,
+                "num_comments": 4,
+                "subreddit": "s",
+                "title": "t",
+                "author": "a",
+                "url": "u",
+                "flair": "X",
+                "awards": [1, 2],
+            }
+        )
+        self.assertNotIn("X", line.split(" | "))
+        self.assertIn("u/a", line)
+
+
+class FindRdtCacheTest(unittest.TestCase):
+    """Process cache works and cache_clear() re-resolves after PATH changes."""
+
+    def setUp(self):
+        _mod.find_rdt.cache_clear()
+        self.addCleanup(_mod.find_rdt.cache_clear)
+
+    def test_second_call_is_cached(self):
+        with mock.patch.object(_mod.shutil, "which", return_value="/x/rdt") as m:
+            self.assertEqual(_mod.find_rdt(), "/x/rdt")
+            self.assertEqual(_mod.find_rdt(), "/x/rdt")
+            self.assertEqual(m.call_count, 1)
+
+    def test_clear_resolves_again(self):
+        with mock.patch.object(_mod.shutil, "which", return_value="/a/rdt"):
+            self.assertEqual(_mod.find_rdt(), "/a/rdt")
+        _mod.find_rdt.cache_clear()
+        with mock.patch.object(_mod.shutil, "which", return_value="/b/rdt"):
+            self.assertEqual(_mod.find_rdt(), "/b/rdt")
+
+
+class ExportModeTest(unittest.TestCase):
+    """Rewritten export files carry 0600 permissions."""
+
+    @mock.patch.object(_mod, "run_backend")
+    def test_output_is_owner_only(self, mock_run):
+        mock_run.return_value.returncode = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "mode.csv")
+            with open(out, "w", encoding="utf-8", newline="") as f:
+                f.write("score,num_comments,subreddit,title,author,url\n1,2,s,t,a,u\n")
+            rc = _mod.cmd_export_compact(["-o", out])
+            self.assertEqual(rc, _mod.EX_OK)
+            self.assertEqual(0o777 & os.stat(out).st_mode, 0o600)
 
 
 if __name__ == "__main__":

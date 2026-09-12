@@ -21,7 +21,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
-from functools import partial
+from functools import lru_cache, partial
 from typing import NoReturn
 
 # Compact mode limits (contract: fields are dropped, text is never cut).
@@ -30,6 +30,8 @@ LIST_CAP_N = 10
 SUBS_CAP_N = 5
 SUBS_CAP_SUBS = 5
 EXPORT_CAP_N = 50
+# --count is a backend alias for -n/--limit; all three are clamped
+# and defaulted identically by the compact limit policy.
 LIMIT_FLAGS = {"-n", "--limit", "--count"}
 
 LISTING_HEADER = "no | score | sub | title | author | id"
@@ -38,7 +40,9 @@ UCOMMENTS_HEADER = "no | author | score | sub | body | id"
 MIXED_HEADER = "kind | no | score | sub | title/body | author | id"
 EXPORT_HEADER = "score | sub | title | author | url"
 
-BACKEND_TIMEOUT = 30
+BACKEND_TIMEOUT = 30  # seconds; override via RDT_TIDY_TIMEOUT (see backend_timeout()).
+BACKEND_TIMEOUT_ENV = "RDT_TIDY_TIMEOUT"
+MAX_BACKEND_BYTES = 10 * 1024 * 1024  # bytes; larger payloads fail closed in load_envelope().
 EX_OK = 0
 EX_BACKEND = 1  # backend failure (ERR ... on stdout)
 EX_USAGE = 2  # usage error (unknown command, export without -o)
@@ -50,7 +54,6 @@ COMMENT_LIST_CMDS = {"user-comments"}
 MIXED_CMDS = {"saved", "upvoted"}
 DETAIL_CMDS = {"read", "show"}
 PASS_CMDS = {
-    "status",
     "open",
     "upvote",
     "save",
@@ -64,7 +67,7 @@ KNOWN_CMDS = (
     | COMMENT_LIST_CMDS
     | MIXED_CMDS
     | DETAIL_CMDS
-    | {"sub-info", "user", "whoami", "export"}
+    | {"sub-info", "user", "whoami", "status", "export"}
     | PASS_CMDS
 )
 
@@ -92,17 +95,24 @@ Compact mode rules (summary):
   saved/upvoted: first column is kind (P post / C comment)
   read/show: header line, LINK (if external), body (line breaks kept),
     ---, all comments; replies indented by two spaces
-  table cells are single-line; a literal '|' inside a cell is data
+  table cells are single-line; a literal '|' in cell text is escaped as '\\|'
   sub-info: 3 lines (subscribers/online, date, full description)
   user/whoami: single line (+ session line for whoami)
+  status: single line (auth, user, caps; no local paths)
   trailing: next <cursor> (if any). error: ERR <code>: <message>
   listing default n=5, cap n=10. feed --subs-only cap 5x5.
   export --compact needs a file (-o), never prints to stdout; default n=50, cap n=50.
 """
 
 
+@lru_cache(maxsize=1)
 def find_rdt() -> str:
-    """Locate the rdt executable on PATH or under ~/.local/bin."""
+    """Locate the rdt executable on PATH or under ~/.local/bin.
+
+    Cached for the process lifetime; in-process callers that mutate PATH
+    must call ``find_rdt.cache_clear()`` to re-resolve. Subprocess-based
+    end-to-end tests are unaffected (fresh process per call).
+    """
     found = shutil.which("rdt")
     if found:
         return found
@@ -112,9 +122,18 @@ def find_rdt() -> str:
     return "rdt"
 
 
+# Whitespace policy (pure helpers; runs collapse, text is never cut):
+# squish collapses everything to one line (table cells, error messages);
+# _safe_cell is squish plus pipe escaping for `|`-separated tables;
+# flow collapses inline runs but keeps paragraph line breaks (bodies).
 def squish(text: object) -> str:
     """Collapse internal whitespace into single spaces and strip edges."""
     return " ".join(str(text).split())
+
+
+def _safe_cell(text: object) -> str:
+    """Collapse whitespace and escape pipe delimiters for table cells."""
+    return squish(text).replace("|", r"\|")
 
 
 def flow(text: object) -> str:
@@ -154,6 +173,11 @@ def fmt_date(ts: object) -> str:
 
 
 def err_exit(msg: str, code: int = EX_BACKEND) -> NoReturn:
+    # Error-channel policy: infrastructure errors (binary not found,
+    # timeout, OS failures) go to stderr.  Compact data/API errors
+    # (check_error, load_envelope, _run_compact) go to stdout so the
+    # consumer sees them in the output stream.  Usage errors go to
+    # stderr (conventional).
     print(msg, file=sys.stderr)
     raise SystemExit(code)
 
@@ -393,15 +417,25 @@ class TokenView:
         return self
 
 
+def backend_timeout() -> int:
+    """Return backend timeout seconds (env override, default 30)."""
+    try:
+        val = int(os.getenv(BACKEND_TIMEOUT_ENV, "") or BACKEND_TIMEOUT)
+    except (TypeError, ValueError):
+        return BACKEND_TIMEOUT
+    return val if 1 <= val <= 300 else BACKEND_TIMEOUT
+
+
 def run_backend(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Execute the rdt backend CLI with the given arguments."""
+    timeout_s = backend_timeout()
     try:
         return subprocess.run(
             [find_rdt()] + args,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=BACKEND_TIMEOUT,
+            timeout=timeout_s,
             check=False,
         )
     except FileNotFoundError:
@@ -409,16 +443,21 @@ def run_backend(args: list[str]) -> subprocess.CompletedProcess[str]:
     except OSError as exc:
         err_exit(f"ERR backend: cannot execute rdt: {squish(exc)}", EX_BACKEND)
     except subprocess.TimeoutExpired:
-        err_exit("ERR timeout: rdt did not respond within 30s", EX_BACKEND)
+        err_exit(f"ERR timeout: rdt did not respond within {timeout_s}s", EX_BACKEND)
 
 
 def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
-    """Parse JSON stdout or pass through raw backend stream on failure."""
+    """Parse JSON stdout, pass raw backend streams through, or fail closed."""
     # Empty stdout is unusable downstream, so report it as a backend
     # error even when the backend itself exited 0.
     if not proc.stdout.strip():
         detail = squish(proc.stderr) or "empty output"
         print(f"ERR backend: {detail}")
+        raise SystemExit(proc.returncode or EX_BACKEND)
+    if len(proc.stdout) > MAX_BACKEND_BYTES:
+        # Fail closed: an unbounded read payload must not exhaust memory;
+        # the caller gets a controlled ERR instead of a traceback or OOM kill.
+        print(f"ERR backend: response too large ({len(proc.stdout)} bytes)")
         raise SystemExit(proc.returncode or EX_BACKEND)
     try:
         return json.loads(proc.stdout)
@@ -432,17 +471,21 @@ def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
 
 def check_error(env: object) -> None:
     """Exit with formatted ERR if the response envelope flags an error."""
-    if isinstance(env, dict) and not env.get("ok", True):
-        err = env.get("error")
-        if isinstance(err, str):
-            code, msg = "backend", err
-        elif isinstance(err, dict):
-            code = err.get("code", "backend")
-            msg = err.get("message", "unknown error")
-        else:
-            code, msg = "backend", "unknown error"
-        print(f"ERR {code}: {squish(msg)}")
-        raise SystemExit(EX_BACKEND)
+    if not isinstance(env, dict):
+        return
+    # Explicit ok:false, or error key present without an ok key.
+    if env.get("ok", True) and not ("error" in env and "ok" not in env):
+        return
+    err = env.get("error")
+    if isinstance(err, str):
+        code, msg = "backend", err
+    elif isinstance(err, dict):
+        code = err.get("code", "backend")
+        msg = err.get("message", "unknown error")
+    else:
+        code, msg = "backend", "unknown error"
+    print(f"ERR {code}: {squish(msg)}")
+    raise SystemExit(EX_BACKEND)
 
 
 def _envelope_data(env: object) -> dict:
@@ -454,6 +497,10 @@ def _envelope_data(env: object) -> dict:
 
 
 def _child_kind_body(child: object) -> tuple[str, dict]:
+    # Defaults to "t3" (post) when kind is missing or falsy.  Reddit
+    # always includes kind; the fallback only guards malformed data.
+    # child.get("data", child) may alias the input dict when "data" is
+    # absent, which is safe because renderers only read.
     if isinstance(child, dict):
         data = child.get("data", child)
         kind = str(child.get("kind") or "t3")
@@ -490,7 +537,7 @@ def _post_cells(num: int, d: dict) -> dict[str, str]:
         "no": str(num),
         "score": _score_comments_badge(d.get("score", 0), d.get("num_comments", 0)),
         "sub": _sub_tag(d.get("subreddit")),
-        "title": squish(d.get("title", "-") or "-"),
+        "title": _safe_cell(d.get("title", "-") or "-"),
         "author": _user_tag(d.get("author")),
         "id": f"{d.get('id', '')}",
     }
@@ -504,6 +551,9 @@ def _project(row: dict[str, str], order: list[str]) -> str:
 POST_COLS_SUB = ["no", "score", "sub", "title", "author", "id"]
 POST_COLS_NO_SUB = ["no", "score", "title", "author", "id"]
 COMMENT_COLS = ["no", "author", "score", "sub", "body", "id"]
+# MIXED_HEADER says "title/body": posts project "title", comments project
+# "body" at the same positional column.  Alignment is by list order, not
+# by key name.
 MIXED_COMMENT_COLS = ["kind", "no", "score", "sub", "body", "author", "id"]
 MIXED_POST_COLS = ["kind", "no", "score", "sub", "title", "author", "id"]
 EXPORT_COLS = ["score", "sub", "title", "author", "url"]
@@ -522,7 +572,7 @@ def _comment_cells(num: int, d: dict) -> dict[str, str]:
         "author": _user_tag(d.get("author")),
         "score": _signed(d.get("score", 0)),
         "sub": _sub_tag(d.get("subreddit")),
-        "body": squish(d.get("body", "")),
+        "body": _safe_cell(d.get("body", "")),
         "id": f"{d.get('id', '')}",
     }
 
@@ -532,7 +582,7 @@ def comment_line(num: int, d: dict) -> str:
     return _project(_comment_cells(num, d), COMMENT_COLS)
 
 
-def _listing_children(env: object) -> tuple[list[tuple[str, dict]], object]:
+def _listing_children(env: object) -> tuple[list[tuple[str, dict]], str | None]:
     """Unwrap a listing envelope into (kind, data) items plus cursor."""
     data = _envelope_data(env)
     inner = data.get("data") or data
@@ -723,7 +773,12 @@ def _parse_typed_detail(data: dict) -> tuple[dict, list[dict], int]:
 
 
 def _parse_raw_detail(data: list) -> tuple[dict, list[dict], int]:
-    """Parse raw listing shape: [post-listing, comment-listing]."""
+    """Parse raw listing shape: [post-listing, comment-listing].
+
+    Reddit returns exactly two Listing objects.  The guards below handle
+    missing elements, non-dict entries, and non-list children so a
+    malformed response degrades to ({}, [], 0) instead of crashing.
+    """
     post: dict = {}
     comments: list[dict] = []
     if not data:
@@ -795,7 +850,7 @@ def render_detail(env: object) -> str:
         for c in comments:
             text = f"{_user_tag(c.get('author'))} {_signed(c.get('score', 0))}: {flow(c.get('body', ''))}"
             if c.get("depth", 0):
-                lines.extend(f"  {ln}" if ln else ln for ln in text.splitlines())
+                lines.extend(f"  {ln}" for ln in text.splitlines())
             else:
                 lines.append(text)
     if more:
@@ -827,16 +882,42 @@ def render_user(env: object) -> str:
     )
 
 
+def _caps_str(caps: object) -> str:
+    """Format a capability list as a comma string, '-' when empty."""
+    if isinstance(caps, (list, tuple)):
+        return ",".join(str(c) for c in caps if c) or "-"
+    if caps is None:
+        return "-"
+    return squish(caps) or "-"
+
+
+def _mod_flag(present: object) -> int:
+    """Encode a session flag as the modhash:0/1 output suffix."""
+    return 1 if present else 0
+
+
 def render_whoami(env: object) -> str:
     """Format current authenticated user identity and session capabilities."""
     first = render_user(env)
     data = _envelope_data(env)
     sess = data.get("_session") or {}
     if isinstance(sess, dict) and sess:
-        caps = ",".join(sess.get("capabilities", []) or []) or "-"
-        mod = 1 if sess.get("modhash_present") else 0
+        caps = _caps_str(sess.get("capabilities", []))
+        mod = _mod_flag(sess.get("modhash_present"))
         return f"{first}\nsess {caps} modhash:{mod}"
     return first
+
+
+def render_status(env: object) -> str:
+    """Format auth status into a single line without local path leaks."""
+    data = _envelope_data(env)
+    if not bool(data.get("authenticated")):
+        err = squish(data.get("error") or "")
+        return f"auth:no {err}" if err else "auth:no"
+    user = _user_tag(data.get("username"))
+    caps = _caps_str(data.get("capabilities") or [])
+    mod = _mod_flag(data.get("modhash_present"))
+    return f"auth:yes {user} caps:{caps} modhash:{mod}"
 
 
 def backend_args(view: TokenView) -> list[str]:
@@ -851,11 +932,16 @@ INFO_RENDERERS: dict[str, Callable[[object], str]] = {
     "sub-info": render_subinfo,
     "user": render_user,
     "whoami": render_whoami,
+    "status": render_status,
 }
 
 
 def _compact_list_view(cmd: str, rest: list[str]) -> TokenView:
-    """Apply shared limit policy for listing commands (clamp plus default)."""
+    """Apply shared limit policy for listing commands (clamp plus default).
+
+    --count is a backend alias for -n/--limit; all three in LIMIT_FLAGS
+    are clamped and defaulted identically.
+    """
     view = TokenView(rest)
     view.cap(LIMIT_FLAGS, LIST_CAP_N)
     if cmd == "feed" and view.has({"--subs-only"}):
@@ -890,22 +976,20 @@ def cmd_listing(cmd: str, rest: list[str]) -> int:
     return _run_compact(cmd, view, partial(render_listing, show_sub=show_sub))
 
 
-def _cmd_compact_list(
-    cmd: str, rest: list[str], render: Callable[[object], str]
-) -> int:
-    """Run a compact listing command with the shared limit policy."""
-    view = _compact_list_view(cmd, rest)
-    return _run_compact(cmd, view, render)
-
-
 def cmd_comment_list(cmd: str, rest: list[str]) -> int:
     """Handle compact user-comments listing command."""
-    return _cmd_compact_list(cmd, rest, render_comment_list)
+    if TokenView(rest).has({"-o", "--output"}):
+        return cmd_passthrough(cmd, rest)
+    view = _compact_list_view(cmd, rest)
+    return _run_compact(cmd, view, render_comment_list)
 
 
 def cmd_mixed(cmd: str, rest: list[str]) -> int:
     """Handle compact mixed listing commands (saved, upvoted)."""
-    return _cmd_compact_list(cmd, rest, render_mixed)
+    if TokenView(rest).has({"-o", "--output"}):
+        return cmd_passthrough(cmd, rest)
+    view = _compact_list_view(cmd, rest)
+    return _run_compact(cmd, view, render_mixed)
 
 
 def cmd_detail(cmd: str, rest: list[str]) -> int:
@@ -918,7 +1002,7 @@ def _export_line(row: dict) -> str:
     cells = {
         "score": _score_comments_badge(row.get("score", 0), row.get("num_comments", 0)),
         "sub": _sub_tag(row.get("subreddit")),
-        "title": squish(row.get("title", "")),
+        "title": _safe_cell(row.get("title", "")),
         "author": _user_tag(row.get("author")),
         "url": f"{row.get('url', '')}",
     }
@@ -946,7 +1030,7 @@ def cmd_export_compact(rest: list[str]) -> int:
     if not os.path.isfile(outfile):
         # Backend succeeded but produced no file (stdout used or flag
         # ignored): backend discrepancy, not a local disk failure.
-        print(f"ERR backend: export did not write {outfile}", file=sys.stderr)
+        print(f"ERR backend: export did not write {outfile}")
         return EX_BACKEND
     try:
         with open(outfile, encoding="utf-8-sig", newline="") as f:
@@ -957,10 +1041,10 @@ def cmd_export_compact(rest: list[str]) -> int:
                 _export_line(r) for _, r in zip(range(EXPORT_CAP_N), csv.DictReader(f))
             ]
     except OSError as exc:
-        print(f"ERR io: cannot read {outfile}: {exc}", file=sys.stderr)
+        print(f"ERR io: cannot read {outfile}: {exc}")
         return EX_BACKEND
     except csv.Error as exc:
-        print(f"ERR io: cannot parse {outfile}: {exc}", file=sys.stderr)
+        print(f"ERR io: cannot parse {outfile}: {exc}")
         return EX_BACKEND
     lines = [EXPORT_HEADER, *body] if body else []
     # Unique temp name in the target directory (same filesystem, so the
@@ -979,6 +1063,11 @@ def cmd_export_compact(rest: list[str]) -> int:
         ) as f:
             tmp_file = f.name
             f.write("\n".join(lines) + ("\n" if lines else ""))
+        try:
+            os.chmod(tmp_file, 0o600)
+        except OSError:
+            # Best effort: POSIX temp files are already 0600; Windows ACLs may refuse.
+            pass
         os.replace(tmp_file, outfile)
     except OSError as exc:
         if tmp_file:
@@ -986,7 +1075,7 @@ def cmd_export_compact(rest: list[str]) -> int:
                 os.unlink(tmp_file)
             except OSError:
                 pass
-        print(f"ERR io: cannot write {outfile}: {exc}", file=sys.stderr)
+        print(f"ERR io: cannot write {outfile}: {exc}")
         return EX_BACKEND
     print(f"saved {outfile} ({len(body)} rows)")
     return EX_OK
@@ -1008,6 +1097,10 @@ def main(argv: list[str]) -> int:
     rest = list(argv)
     while rest and rest[0] in TIDY_FLAGS:
         compact = True
+        rest = rest[1:]
+
+    # Skip -- separator between tidy flags and the command.
+    if rest and rest[0] == "--":
         rest = rest[1:]
 
     if not rest or rest[0] in ("-h", "--help"):

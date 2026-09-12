@@ -1,0 +1,1 @@
+{"ok": true, "schema_version": "1", "data": {"authenticated": false, "cookie_count": 0, "credential_file": "/home/user/.config/rdt-cli/credential.json", "source": "none", "username": null, "capabilities": [], "modhash_present": false, "last_verified_at": null, "error": null}}

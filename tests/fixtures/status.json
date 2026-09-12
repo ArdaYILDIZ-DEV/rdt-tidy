@@ -1,0 +1,1 @@
+{"ok": true, "schema_version": "1", "data": {"authenticated": true, "cookie_count": 10, "credential_file": "/home/user/.config/rdt-cli/credential.json", "source": "browser:subprocess", "username": "spez", "capabilities": ["read", "write"], "modhash_present": true, "last_verified_at": null, "error": null}}

@@ -400,11 +400,11 @@ class CompactE2ETest(unittest.TestCase):
         p = run({"RDT_EXPORT_SKIP": "1"}, "--compact", "export", "x", "-o", missing)
         self.assertEqual(p.returncode, 1, str(p.returncode))
         self.assertEqual(
-            p.stderr.strip(),
+            p.stdout.strip(),
             f"ERR backend: export did not write {missing}",
             repr((p.stdout, p.stderr)),
         )
-        self.assertNotIn("ERR io", p.stderr, repr(p.stderr))
+        self.assertNotIn("ERR io", p.stdout, repr(p.stdout))
 
     def test_25_dashdash_escapes_help_flags(self):
         p = run(
@@ -630,6 +630,62 @@ class CompactE2ETest(unittest.TestCase):
         )
         p = run({"RDT_FIXTURE": null_author_comment}, "--compact", "read", "na1")
         self.assertIn("u/? +2: null author body", p.stdout, repr(p.stdout))
+
+    def test_38_compact_status_single_line_no_path_leak(self):
+        p = run(
+            {"RDT_FIXTURE": fixture("status.json"), "RDT_ARGV_LOG": self.log},
+            "--compact",
+            "status",
+        )
+        self.assertEqual(p.returncode, 0, repr((p.returncode, p.stderr)))
+        self.assertEqual(
+            p.stdout.strip(),
+            "auth:yes u/spez caps:read,write modhash:1",
+            repr(p.stdout),
+        )
+        self.assertNotIn("credential", p.stdout, repr(p.stdout))
+        self.assertNotIn("/home/", p.stdout, repr(p.stdout))
+        argv = last_argv(self.log)
+        self.assertIn("--json", argv, repr(argv))
+        p = run({"RDT_FIXTURE": fixture("status_anon.json")}, "--compact", "status")
+        self.assertEqual(p.stdout.strip(), "auth:no", repr(p.stdout))
+        p = run({"RDT_FIXTURE": fixture("status.json")}, "status")
+        self.assertEqual(p.stdout, read_fixture("status.json"), repr(p.stdout[:100]))
+
+    def test_39_passthrough_never_injects_json(self):
+        # comment has no --json support; tidy must forward verbatim even in
+        # compact mode (shim rejects --json to prove nothing was injected).
+        p = run(
+            {
+                "RDT_FIXTURE": fixture("status.json"),
+                "RDT_ARGV_LOG": self.log,
+                "RDT_REJECT_FLAGS": "--json",
+            },
+            "--compact",
+            "comment",
+            "1abc11",
+            "hello",
+        )
+        self.assertEqual(p.returncode, 0, repr((p.returncode, p.stderr)))
+        argv = last_argv(self.log)
+        self.assertEqual(argv, ["comment", "1abc11", "hello"], repr(argv))
+
+    def test_40_compact_strips_yaml_for_info(self):
+        # status supports --json but not --yaml here; tidy must drop --yaml.
+        p = run(
+            {
+                "RDT_FIXTURE": fixture("status.json"),
+                "RDT_ARGV_LOG": self.log,
+                "RDT_REJECT_FLAGS": "--yaml",
+            },
+            "--compact",
+            "status",
+            "--yaml",
+        )
+        self.assertEqual(p.returncode, 0, repr((p.returncode, p.stderr)))
+        argv = last_argv(self.log)
+        self.assertNotIn("--yaml", argv, repr(argv))
+        self.assertIn("--json", argv, repr(argv))
 
 
 if __name__ == "__main__":

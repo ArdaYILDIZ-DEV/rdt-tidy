@@ -10,6 +10,16 @@ if log:
         f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\n")
 
 argv = sys.argv[1:]
+# RDT_REJECT_FLAGS=--json,--yaml makes the shim reject those flags with
+# exit 2 (mimics backend "No such option"), so tests can lock tidy flag
+# stripping/passthrough contracts for commands without structured output.
+reject = {f.strip() for f in os.environ.get("RDT_REJECT_FLAGS", "").split(",") if f.strip()}
+if reject:
+    for tok in argv:
+        base = tok.split("=", 1)[0]
+        if base in reject:
+            print(f"Error: No such option '{base}'.", file=sys.stderr)
+            raise SystemExit(2)
 if argv and argv[0] == "export":
     # RDT_EXPORT_SKIP=1 simulates a backend that exits 0 without writing
     # the file (stdout used / flag ignored) for the missing-file guard test.
