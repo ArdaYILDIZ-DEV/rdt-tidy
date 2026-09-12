@@ -1,11 +1,11 @@
 <p align="center">
   <strong>Single-file wrapper that shrinks rdt-cli output into model-friendly lines.</strong><br>
   <a href="https://pypi.org/project/rdt-cli/"><img src="https://img.shields.io/pypi/v/rdt-cli.svg?style=flat-square" alt="rdt-cli on PyPI"></a>
-  <img src="https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/deps-stdlib%20only-green?style=flat-square" alt="stdlib only">
 </p>
 
-rdt-tidy runs the `rdt` binary as a subprocess. Without flags it passes output through unchanged. In `--compact` mode it converts the raw JSON response into short, positional lines, cutting token cost 27-38x on live data. It has no dependencies, uses only the standard library, and never touches credentials or caches.
+rdt-tidy runs the `rdt` binary as a subprocess. Without flags it passes output through unchanged. In `--compact` mode it converts the raw JSON response into short, positional lines, cutting token cost ~20-65x on live data (workload-dependent; listings benefit most, large threads less). It has no dependencies, uses only the standard library, and never touches credentials or caches.
 
 ## Quick start
 
@@ -33,13 +33,15 @@ Replace `{skill-dir}` with your harness's skill folder location, for example `.a
 - External links are detected defensively: `LINK {url}` is emitted whenever a non-empty URL differs from the permalink, even if `is_self` is omitted or null in the payload.
 - `export --compact` cleans invocation flags: `-c`, `--compact`, and `--yaml` are stripped before delegating to `rdt export --format csv`.
 - Listing size limit: default 5, cap 10; `feed --subs-only` is capped at 5x5.
+- Write paths (`open`, `upvote`, `save`, `subscribe`, `comment`, `login`, `logout`) stay passthrough by design: single-line backend outputs with no compact envelope to strip.
+- Backend responses over 10 MiB fail closed with `ERR backend: response too large` instead of exhausting memory.
 - Position-independent option parsing: query and text fields (including `-c`, `-nonsense`) are never confused with flags.
 - Empty backend output is never silently passed through; it returns `ERR backend` with exit code 1.
 - Token savings come from dropping redundant fields, not from truncating text.
 
 ## Requirements
 
-- Python 3.8 or later (verified on 3.13.5).
+- Python 3.10 or later (verified on 3.13.5).
 - A working `rdt` install on PATH or under `~/.local/bin/` (see below).
 - `uv` or `pipx` to install rdt-cli.
 
@@ -132,11 +134,11 @@ Every option except the mode flag is forwarded to the matching rdt command as-is
 | `sub-info` | 3 lines: subscriber info, date, description |
 | `user` | Single line: karma and account age |
 | `whoami` | User line + session line |
-| `status` | Passed through |
+| `status` | Single line: auth, user, caps |
 | `export` | Short lines written to a file, only a summary on stdout |
 | `open`, `upvote`, `save`, `subscribe`, `comment`, `login`, `logout` | Passed through |
 
-In compact mode, `-n` defaults to 5 and caps at 10 for every command except `read` and `show`. For `read` and `show`, `-n` goes to the backend as-is with no cap. In `export --compact`, tidy-specific flags (`-c`, `--compact`, `--yaml`) are stripped, and the backend is invoked with `--format csv` to produce an intermediate file before rewriting to short lines.
+In compact mode, `-n` defaults to 5 and caps at 10 for every command except `read` and `show`. For `read` and `show`, `-n` goes to the backend as-is with no cap: prefer a small `-n` and paginate, since `-n 100 --expand-more` on a large thread can return megabytes. In `export --compact`, tidy-specific flags (`-c`, `--compact`, `--yaml`) are stripped, and the backend is invoked with `--format csv` to produce an intermediate file before rewriting to short lines.
 
 ## Comment expansion
 
@@ -156,7 +158,7 @@ The backend exited without stdout. For `show`, the cache is usually empty. Run a
 
 ### `ERR forbidden: ...`
 
-Reddit rejected anonymous access. Run `rdt status` for diagnosis. When it shows `authenticated: false`, fetch browser cookies with `rdt login`, then retry the command.
+Reddit rejected anonymous access. Run `rdt status` for diagnosis. When it shows `authenticated: false` (compact: `auth:no`), fetch browser cookies with `rdt login`, then retry the command.
 
 ### `ERR usage: export --compact requires a file (-o FILE)`
 
@@ -172,7 +174,7 @@ rdt-tidy --compact export "python tips" -o tips.txt
 
 ### `ERR timeout: rdt did not respond within 30s`
 
-The backend did not return within 30 seconds. Check the network connection and retry with a smaller limit (`-n 5`).
+The backend did not return within 30 seconds (default; override with `RDT_TIDY_TIMEOUT=1..300`). Check the network connection and retry with a smaller limit (`-n 5`).
 
 ### `ERR backend: invalid envelope`
 
@@ -207,7 +209,7 @@ no | score | sub | title | author | id
 next t3_1abc22
 ```
 
-For the `sub` command the `sub` column drops along with its header. `user-comments` is a headed table: `no | author | score | sub | body | id`. In `saved` and `upvoted` output the first column is kind: `P` (post) or `C` (comment). When a paging cursor exists, the last line is `next <cursor>`. On error a single line prints: `ERR <code>: <message>`. Table cells are single-line; a literal `|` inside a title or body stays unescaped.
+For the `sub` command the `sub` column drops along with its header. `user-comments` is a headed table: `no | author | score | sub | body | id`. In `saved` and `upvoted` output the first column is kind: `P` (post) or `C` (comment). When a paging cursor exists, the last line is `next <cursor>`. On error a single line prints: `ERR <code>: <message>`. Table cells are single-line; a literal `|` inside a title or body is escaped as `\|`.
 
 Read (`read`, `show`):
 
@@ -229,7 +231,7 @@ Info commands:
 sub-info →  r/python 1200000 subs 5000 online / created 2008-01-27 / description
 user     →  u/spez post:100 comment:200 age:2005-09-12
 whoami   →  user line + second line: sess read,vote modhash:1
-status   →  passed through
+status   →  auth:yes u/spez caps:read,write modhash:1 (auth:no when logged out)
 ```
 
 ## Exit codes
@@ -251,7 +253,8 @@ status   →  passed through
 | Title, body, comment, description | Never truncated, printed in full |
 | Comment depth | Iterative traversal (no recursion limit); replies flatten to one level, marked by indent |
 | `export --compact` | At most 50 lines, `-o FILE` required, tidy flags stripped, intermediate CSV format |
-| Backend timeout | 30 seconds |
+| Backend timeout | 30 seconds default (`RDT_TIDY_TIMEOUT`, 1-300) |
+| Backend response | Rejected with `ERR backend: response too large` over 10 MiB |
 
 ## Data files
 
@@ -269,7 +272,7 @@ rdt-tidy creates no config file of its own and stores no credentials. It reuses 
     ├── test_detail_robustness.py   # regression tests: malformed envelopes, deep nesting
     ├── shim
     │   └── rdt            # fake rdt binary for tests
-    └── fixtures            # 10 synthetic JSON responses
+    └── fixtures            # 12 synthetic JSON responses
 ```
 
 ## Development and testing
@@ -280,7 +283,7 @@ python3 tests/test_tidy.py
 python3 tests/test_tokens.py
 ```
 
-The suite holds 37 end-to-end scenarios, 58 unit tests, and 17 regression tests (112 total) and needs no network access. Full run:
+The suite holds 141 tests (40 end-to-end in `test_tidy.py`, 84 unit in `test_tokens.py`, 17 robustness in `test_detail_robustness.py`) and needs no network access. Full run:
 
 ```sh
 python3 -m unittest discover tests
@@ -296,7 +299,8 @@ python3 tests/test_tokens.py
 Live smoke test, no login required:
 
 ```sh
-diff <(rdt status) <(./rdt-tidy status)
+diff <(rdt status) <(./rdt-tidy status)   # passthrough only; --compact status differs by design
+./rdt-tidy --compact status              # auth:yes u/... caps:... / auth:no
 ./rdt-tidy --compact search "x" -n 2; echo $?
 ```
 
