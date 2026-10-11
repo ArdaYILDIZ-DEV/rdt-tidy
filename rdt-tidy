@@ -30,19 +30,23 @@ LIST_CAP_N = 10
 SUBS_CAP_N = 5
 SUBS_CAP_SUBS = 5
 EXPORT_CAP_N = 50
-# --count is a backend alias for -n/--limit; all three are clamped
-# and defaulted identically by the compact limit policy.
+# Listings accept -n/--limit; export accepts -n/--count.
+# Track both names without translating options unsupported by the backend.
 LIMIT_FLAGS = {"-n", "--limit", "--count"}
 
-LISTING_HEADER = "no | score | sub | title | author | id"
-LISTING_HEADER_NO_SUB = "no | score | title | author | id"
-UCOMMENTS_HEADER = "no | author | score | sub | body | id"
-MIXED_HEADER = "kind | no | score | sub | title/body | author | id"
-EXPORT_HEADER = "score | sub | title | author | url"
+LISTING_HEADER = "no | score | sub | title | author | id | created_utc"
+LISTING_HEADER_NO_SUB = "no | score | title | author | id | created_utc"
+UCOMMENTS_HEADER = "no | author | score | sub | body | id | created_utc"
+MIXED_HEADER = "kind | no | score | sub | title/body | author | id | created_utc"
+EXPORT_HEADER = "score | sub | title | author | url | created_utc"
+CSV_EXPORT_COLS = [
+    "title", "subreddit", "author", "score", "num_comments", "url", "permalink",
+    "created_utc",
+]
 
 BACKEND_TIMEOUT = 30  # seconds; override via RDT_TIDY_TIMEOUT (see backend_timeout()).
 BACKEND_TIMEOUT_ENV = "RDT_TIDY_TIMEOUT"
-MAX_BACKEND_BYTES = 10 * 1024 * 1024  # bytes; larger payloads fail closed in load_envelope().
+MAX_BACKEND_BYTES = 10 * 1024 * 1024  # UTF-8 bytes; stdout is checked after capture.
 EX_OK = 0
 EX_BACKEND = 1  # backend failure (ERR ... on stdout)
 EX_USAGE = 2  # usage error (unknown command, export without -o)
@@ -90,18 +94,24 @@ subscribe comment status whoami login logout.
 
 Compact mode rules (summary):
   listings are tables: header line + '|' separated rows
-    (no | score | sub | title | author | id; sub command has no sub column)
-  user-comments: no | author | score | sub | body | id
+    (no | score | sub | title | author | id | created_utc; sub has no sub column)
+  user-comments: no | author | score | sub | body | id | created_utc
   saved/upvoted: first column is kind (P post / C comment)
-  read/show: header line, LINK (if external), body (line breaks kept),
-    ---, all comments; replies indented by two spaces
+  created_utc: YYYY-MM-DDTHH:MM:SSZ (UTC); missing/invalid dates are '-'.
+  read/show: post header ends with created_utc; comments show [UTC date]
+    before ':'; LINK (if external), body (line breaks kept), ---, all comments;
+    replies indented by two spaces
   table cells are single-line; a literal '|' in cell text is escaped as '\\|'
-  sub-info: 3 lines (subscribers/online, date, full description)
+  sub-info: subscribers/online, date, public description (if nonempty)
   user/whoami: single line (+ session line for whoami)
   status: single line (auth, user, caps; no local paths)
   trailing: next <cursor> (if any). error: ERR <code>: <message>
+  backend stderr is preserved; table no does not refresh rdt's index cache.
+    prefer read <post-id> after browse listings (rdt 0.4.1).
   listing default n=5, cap n=10. feed --subs-only cap 5x5.
-  export --compact needs a file (-o), never prints to stdout; default n=50, cap n=50.
+  export --compact needs a file (-o); default n=50, cap n=50.
+    default: short table with created_utc; --format csv: CSV with created_utc.
+    backend JSON is staged privately; stdout contains only the saved summary.
 """
 
 
@@ -161,23 +171,37 @@ def flow(text: object) -> str:
 def fmt_date(ts: object) -> str:
     """Format UTC timestamp as YYYY-MM-DD, or '-' when missing or invalid."""
     try:
-        num = float(ts)  # type: ignore[arg-type]  # ts is untyped object; float parses int/str/float.
-    except (TypeError, ValueError, OverflowError):
+        num = float(ts)  # type: ignore[arg-type]  # Backend timestamps may be numeric strings.
+        if not num:
+            return "-"
+        return datetime.fromtimestamp(num, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
         return "-"
-    if not num:
+
+
+def fmt_created_utc(ts: object) -> str:
+    """Format Reddit Unix seconds as UTC ISO 8601, without fractional seconds.
+
+    Zero is the backend's missing-value sentinel. Nonpositive, boolean,
+    malformed and out-of-range values render as '-' rather than a fake date.
+    """
+    if isinstance(ts, bool):
         return "-"
     try:
-        return datetime.fromtimestamp(num, tz=timezone.utc).strftime("%Y-%m-%d")
-    except (OverflowError, OSError, ValueError):
+        num = float(ts)  # type: ignore[arg-type]  # Backend values may also be numeric strings.
+        if num <= 0:
+            return "-"
+        # Truncate before conversion so microsecond rounding cannot change the second.
+        return datetime.fromtimestamp(int(num), tz=timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+    except (TypeError, ValueError, OverflowError, OSError):
         return "-"
 
 
 def err_exit(msg: str, code: int = EX_BACKEND) -> NoReturn:
-    # Error-channel policy: infrastructure errors (binary not found,
-    # timeout, OS failures) go to stderr.  Compact data/API errors
-    # (check_error, load_envelope, _run_compact) go to stdout so the
-    # consumer sees them in the output stream.  Usage errors go to
-    # stderr (conventional).
+    # Infrastructure/usage errors go to stderr; compact data/API errors
+    # go to stdout for table consumers. Backend stderr is forwarded unchanged.
     print(msg, file=sys.stderr)
     raise SystemExit(code)
 
@@ -320,17 +344,14 @@ class TokenView:
         return _follow_val(t)
 
     def _matching(self, names: set[str]) -> Iterator[int]:
-        """Yield indices of flags whose option name is in `names`."""
         for i in range(len(self.tokens)):
             if self._option_slot(i)[0] in names:
                 yield i
 
     def indices(self, names: set[str]) -> list[int]:
-        """Return indices of matching flags, including packed short forms."""
         return list(self._matching(names))
 
     def has(self, names: set[str]) -> bool:
-        """Return True if any of the given option names are present."""
         return next(self._matching(names), None) is not None
 
     def value(self, names: set[str]) -> str | None:
@@ -361,14 +382,13 @@ class TokenView:
         return self
 
     def _insertion_point(self) -> int:
-        """Find index before the first '--' separator, or end when absent."""
         for i, t in enumerate(self.tokens):
             if t == "--" and self.kinds[i] == "f":
                 return i
         return len(self.tokens)
 
     def ensure(self, flag: str, value: str, names: set[str]) -> TokenView:
-        """Append the default option when none is present."""
+        """Insert a default before '--', preserving explicit backend values."""
         if not self.has(names):
             at = self._insertion_point()
             self.tokens[at:at] = [flag, value]
@@ -376,7 +396,6 @@ class TokenView:
         return self
 
     def add_bare(self, flag: str) -> TokenView:
-        """Append a valueless flag (e.g. --json)."""
         at = self._insertion_point()
         self.tokens.insert(at, flag)
         self.kinds.insert(at, "f")
@@ -444,6 +463,8 @@ def run_backend(args: list[str]) -> subprocess.CompletedProcess[str]:
         err_exit(f"ERR backend: cannot execute rdt: {squish(exc)}", EX_BACKEND)
     except subprocess.TimeoutExpired:
         err_exit(f"ERR timeout: rdt did not respond within {timeout_s}s", EX_BACKEND)
+    except UnicodeError:
+        err_exit("ERR backend: rdt output is not valid UTF-8", EX_BACKEND)
 
 
 def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
@@ -454,13 +475,15 @@ def load_envelope(proc: subprocess.CompletedProcess[str]) -> object:
         detail = squish(proc.stderr) or "empty output"
         print(f"ERR backend: {detail}")
         raise SystemExit(proc.returncode or EX_BACKEND)
-    if len(proc.stdout) > MAX_BACKEND_BYTES:
-        # Fail closed: an unbounded read payload must not exhaust memory;
-        # the caller gets a controlled ERR instead of a traceback or OOM kill.
-        print(f"ERR backend: response too large ({len(proc.stdout)} bytes)")
+    size = len(proc.stdout.encode("utf-8"))
+    if size > MAX_BACKEND_BYTES:
+        print(f"ERR backend: response too large ({size} bytes)")
         raise SystemExit(proc.returncode or EX_BACKEND)
     try:
         return json.loads(proc.stdout)
+    except RecursionError:
+        print("ERR backend: JSON nesting too deep")
+        raise SystemExit(proc.returncode or EX_BACKEND) from None
     except json.JSONDecodeError:
         # Not JSON: pass through untouched to avoid data loss.
         sys.stdout.write(proc.stdout)
@@ -489,7 +512,6 @@ def check_error(env: object) -> None:
 
 
 def _envelope_data(env: object) -> dict:
-    """Safely extract data dict from an envelope, returning {} if missing."""
     if isinstance(env, dict):
         d = env.get("data")
         return d if isinstance(d, dict) else {}
@@ -497,10 +519,7 @@ def _envelope_data(env: object) -> dict:
 
 
 def _child_kind_body(child: object) -> tuple[str, dict]:
-    # Defaults to "t3" (post) when kind is missing or falsy.  Reddit
-    # always includes kind; the fallback only guards malformed data.
-    # child.get("data", child) may alias the input dict when "data" is
-    # absent, which is safe because renderers only read.
+    # Missing kind defaults to a post; renderers never mutate the source dict.
     if isinstance(child, dict):
         data = child.get("data", child)
         kind = str(child.get("kind") or "t3")
@@ -537,26 +556,24 @@ def _post_cells(num: int, d: dict) -> dict[str, str]:
         "no": str(num),
         "score": _score_comments_badge(d.get("score", 0), d.get("num_comments", 0)),
         "sub": _sub_tag(d.get("subreddit")),
-        "title": _safe_cell(d.get("title", "-") or "-"),
+        "title": str(d.get("title", "-") or "-"),
         "author": _user_tag(d.get("author")),
         "id": f"{d.get('id', '')}",
+        "created_utc": fmt_created_utc(d.get("created_utc")),
     }
 
 
 def _project(row: dict[str, str], order: list[str]) -> str:
-    """Join row fields strictly in header order."""
-    return " | ".join(row[k] for k in order)
+    """Project fields in header order, escaping each table cell exactly once."""
+    return " | ".join(_safe_cell(row[k]) for k in order)
 
 
-POST_COLS_SUB = ["no", "score", "sub", "title", "author", "id"]
-POST_COLS_NO_SUB = ["no", "score", "title", "author", "id"]
-COMMENT_COLS = ["no", "author", "score", "sub", "body", "id"]
-# MIXED_HEADER says "title/body": posts project "title", comments project
-# "body" at the same positional column.  Alignment is by list order, not
-# by key name.
-MIXED_COMMENT_COLS = ["kind", "no", "score", "sub", "body", "author", "id"]
-MIXED_POST_COLS = ["kind", "no", "score", "sub", "title", "author", "id"]
-EXPORT_COLS = ["score", "sub", "title", "author", "url"]
+POST_COLS_SUB = LISTING_HEADER.split(" | ")
+POST_COLS_NO_SUB = LISTING_HEADER_NO_SUB.split(" | ")
+COMMENT_COLS = UCOMMENTS_HEADER.split(" | ")
+MIXED_COMMENT_COLS = MIXED_HEADER.replace("title/body", "body").split(" | ")
+MIXED_POST_COLS = MIXED_HEADER.replace("title/body", "title").split(" | ")
+EXPORT_COLS = EXPORT_HEADER.split(" | ")
 
 
 def post_line(num: int, d: dict, show_sub: bool) -> str:
@@ -572,13 +589,13 @@ def _comment_cells(num: int, d: dict) -> dict[str, str]:
         "author": _user_tag(d.get("author")),
         "score": _signed(d.get("score", 0)),
         "sub": _sub_tag(d.get("subreddit")),
-        "body": _safe_cell(d.get("body", "")),
+        "body": str(d.get("body", "")),
         "id": f"{d.get('id', '')}",
+        "created_utc": fmt_created_utc(d.get("created_utc")),
     }
 
 
 def comment_line(num: int, d: dict) -> str:
-    """Format a single comment row."""
     return _project(_comment_cells(num, d), COMMENT_COLS)
 
 
@@ -653,58 +670,11 @@ def render_mixed(env: object) -> str:
 
 
 def _is_more(node: dict) -> bool:
-    """Return True for Reddit `more` placeholder stubs."""
     return node.get("author") == "[more]" or node.get("kind") == "more"
 
 
 def _as_list(value: object) -> list:
-    """Return value when it is a list, else []."""
     return value if isinstance(value, list) else []
-
-
-def _typed_replies(node: dict) -> list[dict]:
-    """Flatten nested replies depth-first (iterative: depth is unbounded)."""
-    out: list[dict] = []
-    stack = [node]
-    while stack:
-        parent = stack.pop()
-        kids = [
-            rep
-            for rep in parent.get("replies", []) or []
-            if isinstance(rep, dict) and not _is_more(rep)
-        ]
-        for rep in kids:
-            out.append(
-                {
-                    "author": rep.get("author") or "?",
-                    "body": rep.get("body", ""),
-                    "score": rep.get("score", 0),
-                    "depth": 1,
-                }
-            )
-        stack.extend(reversed(kids))
-    return out
-
-
-def _typed_more(node: dict) -> int:
-    """Count hidden `more` items in nested replies (iterative)."""
-    more = 0
-    stack = [node]
-    while stack:
-        parent = stack.pop()
-        for rep in parent.get("replies", []) or []:
-            if not isinstance(rep, dict):
-                continue
-            if _is_more(rep):
-                more += (
-                    _inum(rep.get("more_count"))
-                    or len(_as_list(rep.get("more_children", [])))
-                    or 1
-                )
-            else:
-                more += _inum(rep.get("more_count"))
-                stack.append(rep)
-    return more
 
 
 def _raw_comment_of(d: dict, depth: int = 0) -> dict:
@@ -713,6 +683,7 @@ def _raw_comment_of(d: dict, depth: int = 0) -> dict:
         "author": d.get("author") or "?",
         "body": d.get("body", ""),
         "score": d.get("score", 0),
+        "created_utc": d.get("created_utc"),
         "depth": min(depth, 1),
     }
 
@@ -751,43 +722,47 @@ def _absorb_raw_child(child: object, comments: list[dict], depth: int = 0) -> in
 
 
 def _parse_typed_detail(data: dict) -> tuple[dict, list[dict], int]:
-    """Parse typed detail shape: {post, comments, more_count}."""
+    """Flatten typed comments and count hidden items in a single iterative walk."""
     raw_post = data.get("post") or {}
     post = raw_post if isinstance(raw_post, dict) else {}
     comments: list[dict] = []
     more = _inum(data.get("more_count"))
-    for node in data.get("comments") or []:
-        if not isinstance(node, dict):
-            continue
-        if _is_more(node):
-            more += (
-                _inum(node.get("more_count"))
-                or len(_as_list(node.get("more_children", [])))
-                or 1
+    for node in _as_list(data.get("comments")):
+        # Append siblings before descending, preserving the existing typed order.
+        stack = [([node], 0)]
+        while stack:
+            siblings, depth = stack.pop()
+            parents = []
+            for comment in siblings:
+                if not isinstance(comment, dict):
+                    continue
+                if _is_more(comment):
+                    more += (
+                        _inum(comment.get("more_count"))
+                        or len(_as_list(comment.get("more_children")))
+                        or 1
+                    )
+                    continue
+                comments.append(
+                    _raw_comment_of(comment, 1) if depth else {**comment, "depth": 0}
+                )
+                more += _inum(comment.get("more_count"))
+                parents.append(comment)
+            stack.extend(
+                (_as_list(parent.get("replies")), 1) for parent in reversed(parents)
             )
-            continue
-        comments.append({**node, "depth": 0})
-        more += _inum(node.get("more_count")) + _typed_more(node)
-        comments.extend(_typed_replies(node))
     return post, comments, more
 
 
 def _parse_raw_detail(data: list) -> tuple[dict, list[dict], int]:
-    """Parse raw listing shape: [post-listing, comment-listing].
-
-    Reddit returns exactly two Listing objects.  The guards below handle
-    missing elements, non-dict entries, and non-list children so a
-    malformed response degrades to ({}, [], 0) instead of crashing.
-    """
+    """Parse [post-listing, comment-listing]; malformed containers are empty."""
     post: dict = {}
     comments: list[dict] = []
     if not data:
         return {}, [], 0
     first = data[0] if isinstance(data[0], dict) else {}
     first_data = first.get("data")
-    kids = first_data.get("children", []) if isinstance(first_data, dict) else []
-    if not isinstance(kids, list):
-        kids = []
+    kids = _as_list(first_data.get("children")) if isinstance(first_data, dict) else []
     if kids and isinstance(kids[0], dict):
         inner = kids[0].get("data") or {}
         post = inner if isinstance(inner, dict) else {}
@@ -795,9 +770,9 @@ def _parse_raw_detail(data: list) -> tuple[dict, list[dict], int]:
     second = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
     second_data = second.get("data")
     second_kids = (
-        second_data.get("children", []) if isinstance(second_data, dict) else []
+        _as_list(second_data.get("children")) if isinstance(second_data, dict) else []
     )
-    for child in second_kids or []:
+    for child in second_kids:
         more += _absorb_raw_child(child, comments, depth=0)
     return post, comments, more
 
@@ -837,7 +812,12 @@ def render_detail(env: object) -> str:
     post, comments, more = parse_detail(data)
     pid = post.get("id", "?")
     lines = [
-        f"# {pid} {_sub_tag(post.get('subreddit'))} | {squish(post.get('title', '-') or '-')} | {_user_tag(post.get('author'))} {_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c)"
+        (
+            f"# {pid} {_sub_tag(post.get('subreddit'))} | "
+            f"{squish(post.get('title', '-') or '-')} | {_user_tag(post.get('author'))} "
+            f"{_signed(post.get('score', 0))} ({_inum(post.get('num_comments', 0))}c) | "
+            f"created_utc {fmt_created_utc(post.get('created_utc'))}"
+        )
     ]
     url = str(post.get("url", "") or "")
     if _is_external_link(post):
@@ -848,7 +828,10 @@ def render_detail(env: object) -> str:
     if comments:
         lines.append("---")
         for c in comments:
-            text = f"{_user_tag(c.get('author'))} {_signed(c.get('score', 0))}: {flow(c.get('body', ''))}"
+            text = (
+                f"{_user_tag(c.get('author'))} {_signed(c.get('score', 0))} "
+                f"[{fmt_created_utc(c.get('created_utc'))}]: {flow(c.get('body', ''))}"
+            )
             if c.get("depth", 0):
                 lines.extend(f"  {ln}" for ln in text.splitlines())
             else:
@@ -885,14 +868,13 @@ def render_user(env: object) -> str:
 def _caps_str(caps: object) -> str:
     """Format a capability list as a comma string, '-' when empty."""
     if isinstance(caps, (list, tuple)):
-        return ",".join(str(c) for c in caps if c) or "-"
+        return ",".join(squish(c) for c in caps if c) or "-"
     if caps is None:
         return "-"
     return squish(caps) or "-"
 
 
 def _mod_flag(present: object) -> int:
-    """Encode a session flag as the modhash:0/1 output suffix."""
     return 1 if present else 0
 
 
@@ -939,8 +921,7 @@ INFO_RENDERERS: dict[str, Callable[[object], str]] = {
 def _compact_list_view(cmd: str, rest: list[str]) -> TokenView:
     """Apply shared limit policy for listing commands (clamp plus default).
 
-    --count is a backend alias for -n/--limit; all three in LIMIT_FLAGS
-    are clamped and defaulted identically.
+    LIMIT_FLAGS tracks command-specific backend names without adding aliases.
     """
     view = TokenView(rest)
     view.cap(LIMIT_FLAGS, LIST_CAP_N)
@@ -956,7 +937,11 @@ def _run_compact(cmd: str, view: TokenView, render: Callable[[object], str]) -> 
     """Run shared compact pipeline: backend, envelope, error check, render."""
     proc = run_backend([cmd] + backend_args(view))
     env = load_envelope(proc)
+    sys.stderr.write(proc.stderr)
     check_error(env)
+    if proc.returncode:
+        print(f"ERR backend: rdt exited with code {proc.returncode}")
+        return proc.returncode
     if not isinstance(env, dict):
         print("ERR backend: invalid envelope")
         return EX_BACKEND
@@ -965,88 +950,107 @@ def _run_compact(cmd: str, view: TokenView, render: Callable[[object], str]) -> 
 
 
 def cmd_listing(cmd: str, rest: list[str]) -> int:
-    """Handle compact listing commands (feed, popular, sub, etc.)."""
+    """Use the shared limit/file policy for post, comment and mixed tables."""
     if TokenView(rest).has({"-o", "--output"}):
         # File output: let rdt write it so stdout stays clean.
         # Check the original args before compact clamping so -n 50/100
         # to a file is forwarded untouched, not truncated to the cap.
         return cmd_passthrough(cmd, rest)
-    view = _compact_list_view(cmd, rest)
-    show_sub = cmd != "sub"
-    return _run_compact(cmd, view, partial(render_listing, show_sub=show_sub))
-
-
-def cmd_comment_list(cmd: str, rest: list[str]) -> int:
-    """Handle compact user-comments listing command."""
-    if TokenView(rest).has({"-o", "--output"}):
-        return cmd_passthrough(cmd, rest)
-    view = _compact_list_view(cmd, rest)
-    return _run_compact(cmd, view, render_comment_list)
-
-
-def cmd_mixed(cmd: str, rest: list[str]) -> int:
-    """Handle compact mixed listing commands (saved, upvoted)."""
-    if TokenView(rest).has({"-o", "--output"}):
-        return cmd_passthrough(cmd, rest)
-    view = _compact_list_view(cmd, rest)
-    return _run_compact(cmd, view, render_mixed)
-
-
-def cmd_detail(cmd: str, rest: list[str]) -> int:
-    """Handle compact post detail commands (read, show)."""
-    return _run_compact(cmd, TokenView(rest), render_detail)
+    if cmd in COMMENT_LIST_CMDS:
+        render = render_comment_list
+    elif cmd in MIXED_CMDS:
+        render = render_mixed
+    else:
+        render = partial(render_listing, show_sub=cmd != "sub")
+    return _run_compact(cmd, _compact_list_view(cmd, rest), render)
 
 
 def _export_line(row: dict) -> str:
-    """Convert a CSV row into a short export line."""
+    """Convert a raw JSON post into a short export line."""
     cells = {
         "score": _score_comments_badge(row.get("score", 0), row.get("num_comments", 0)),
         "sub": _sub_tag(row.get("subreddit")),
-        "title": _safe_cell(row.get("title", "")),
+        "title": str(row.get("title", "")),
         "author": _user_tag(row.get("author")),
         "url": f"{row.get('url', '')}",
+        "created_utc": fmt_created_utc(row.get("created_utc")),
     }
     return _project(cells, EXPORT_COLS)
 
 
+def _read_export_posts(path: str) -> list[dict]:
+    """Read the backend's raw JSON export, bounded like other backend responses."""
+    with open(path, "rb") as f:
+        raw = f.read(MAX_BACKEND_BYTES + 1)
+    if len(raw) > MAX_BACKEND_BYTES:
+        raise ValueError("export response too large")
+    posts = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(posts, list) or any(not isinstance(p, dict) for p in posts):
+        raise ValueError("expected a JSON list of post objects")
+    return posts[:EXPORT_CAP_N]
+
+
+def _csv_export_row(post: dict) -> dict:
+    """Preserve backend CSV fields and append the standardized UTC timestamp."""
+    row = {key: post.get(key, "") for key in CSV_EXPORT_COLS}
+    row["score"] = post.get("score", 0)
+    row["num_comments"] = post.get("num_comments", 0)
+    permalink = str(post.get("permalink") or "")
+    row["permalink"] = (
+        f"https://reddit.com{permalink}" if permalink.startswith("/") else permalink
+    )
+    row["created_utc"] = fmt_created_utc(post.get("created_utc"))
+    return row
+
+
 def cmd_export_compact(rest: list[str]) -> int:
-    """Fetch backend CSV export and rewrite it atomically to compact rows."""
+    """Fetch raw JSON, then atomically write compact rows or explicit CSV."""
     view = TokenView(rest)
+    # These options are rewritten below, so validate rather than silently
+    # repairing malformed input that could overwrite an unintended target.
+    for i in view.indices({"-o", "--output", "--format"}):
+        name, value, _ = view._option_slot(i)
+        if value is None:
+            print(f"ERR usage: {name} requires a value", file=sys.stderr)
+            return EX_USAGE
+    fmt = view.value({"--format"})
+    if fmt not in (None, "csv", "json"):
+        print("ERR usage: --format must be csv or json", file=sys.stderr)
+        return EX_USAGE
     outfile = view.value({"-o", "--output"})
     if not outfile:
         print("ERR usage: export --compact requires a file (-o FILE)", file=sys.stderr)
         return EX_USAGE
     view.cap(LIMIT_FLAGS, EXPORT_CAP_N)
     view.ensure("-n", str(EXPORT_CAP_N), LIMIT_FLAGS)
-    # Readable CSV as the intermediate format, then shrink to short lines.
+    as_csv = fmt == "csv"
     view.drop(TIDY_FLAGS | {"--yaml"})
-    view.remove({"--format"})
-    view.ensure("--format", "csv", {"--format"})
-    proc = run_backend(["export"] + view.tokens)
-    if proc.returncode != 0:
-        sys.stdout.write(proc.stdout)
-        sys.stderr.write(proc.stderr)
-        return proc.returncode
-    if not os.path.isfile(outfile):
-        # Backend succeeded but produced no file (stdout used or flag
-        # ignored): backend discrepancy, not a local disk failure.
-        print(f"ERR backend: export did not write {outfile}")
-        return EX_BACKEND
+    view.remove({"--format", "-o", "--output"})
+    view.ensure("--format", "json", {"--format"})
+    # Never let the backend overwrite the destination before validation.
+    # The private stage also prevents stale targets from masquerading as
+    # successful exports when the backend produces no file.
     try:
-        with open(outfile, encoding="utf-8-sig", newline="") as f:
-            # Parse only the rows we keep (output is capped at
-            # EXPORT_CAP_N): a rogue oversized backend CSV must not
-            # force us to materialize the whole file in memory.
-            body = [
-                _export_line(r) for _, r in zip(range(EXPORT_CAP_N), csv.DictReader(f))
-            ]
+        with tempfile.TemporaryDirectory(
+            prefix=".rdt-tidy-export-", dir=os.path.dirname(outfile) or "."
+        ) as stage:
+            json_file = os.path.join(stage, "posts.json")
+            view.ensure("-o", json_file, {"-o", "--output"})
+            proc = run_backend(["export"] + view.tokens)
+            if proc.returncode != 0:
+                sys.stdout.write(proc.stdout)
+                sys.stderr.write(proc.stderr)
+                return proc.returncode
+            if not os.path.isfile(json_file):
+                print(f"ERR backend: export did not write {outfile}")
+                return EX_BACKEND
+            posts = _read_export_posts(json_file)
     except OSError as exc:
-        print(f"ERR io: cannot read {outfile}: {exc}")
+        print(f"ERR io: cannot read export for {outfile}: {exc}")
         return EX_BACKEND
-    except csv.Error as exc:
-        print(f"ERR io: cannot parse {outfile}: {exc}")
+    except (ValueError, RecursionError) as exc:
+        print(f"ERR backend: invalid export JSON: {exc}")
         return EX_BACKEND
-    lines = [EXPORT_HEADER, *body] if body else []
     # Unique temp name in the target directory (same filesystem, so the
     # final replace stays atomic): a planted `{outfile}.tmp` file or link
     # can neither hijack nor block the write.
@@ -1062,14 +1066,21 @@ def cmd_export_compact(rest: list[str]) -> int:
             delete=False,
         ) as f:
             tmp_file = f.name
-            f.write("\n".join(lines) + ("\n" if lines else ""))
+            if as_csv:
+                writer = csv.DictWriter(f, fieldnames=CSV_EXPORT_COLS)
+                writer.writeheader()
+                writer.writerows(_csv_export_row(post) for post in posts)
+            elif posts:
+                f.write(EXPORT_HEADER + "\n")
+                for post in posts:
+                    f.write(_export_line(post) + "\n")
         try:
             os.chmod(tmp_file, 0o600)
         except OSError:
             # Best effort: POSIX temp files are already 0600; Windows ACLs may refuse.
             pass
         os.replace(tmp_file, outfile)
-    except OSError as exc:
+    except (OSError, UnicodeError, csv.Error) as exc:
         if tmp_file:
             try:
                 os.unlink(tmp_file)
@@ -1077,7 +1088,7 @@ def cmd_export_compact(rest: list[str]) -> int:
                 pass
         print(f"ERR io: cannot write {outfile}: {exc}")
         return EX_BACKEND
-    print(f"saved {outfile} ({len(body)} rows)")
+    print(f"saved {outfile} ({len(posts)} rows)")
     return EX_OK
 
 
@@ -1091,15 +1102,13 @@ def cmd_passthrough(cmd: str, rest: list[str]) -> int:
 
 def main(argv: list[str]) -> int:
     """Route CLI arguments between passthrough and compact command handlers."""
-    # Mode flags are recognized only before the command; later -c/--compact
-    # belongs to rdt and positional text is left alone.
+    # Only leading mode flags belong to tidy; later flags belong to rdt.
     compact = False
     rest = list(argv)
     while rest and rest[0] in TIDY_FLAGS:
         compact = True
         rest = rest[1:]
 
-    # Skip -- separator between tidy flags and the command.
     if rest and rest[0] == "--":
         rest = rest[1:]
 
@@ -1117,14 +1126,10 @@ def main(argv: list[str]) -> int:
         print(f"ERR usage: unknown command: {cmd}", file=sys.stderr)
         return EX_USAGE
 
-    if cmd in LIST_CMDS:
+    if cmd in LIST_CMDS | COMMENT_LIST_CMDS | MIXED_CMDS:
         return cmd_listing(cmd, args)
-    if cmd in COMMENT_LIST_CMDS:
-        return cmd_comment_list(cmd, args)
-    if cmd in MIXED_CMDS:
-        return cmd_mixed(cmd, args)
     if cmd in DETAIL_CMDS:
-        return cmd_detail(cmd, args)
+        return _run_compact(cmd, TokenView(args), render_detail)
     if cmd in INFO_RENDERERS:
         return _run_compact(cmd, TokenView(args), INFO_RENDERERS[cmd])
     if cmd == "export":

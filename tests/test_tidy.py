@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """rdt-tidy end-to-end tests via a fake rdt shim on PATH."""
 
+import csv
 import json
 import os
 import subprocess
@@ -68,15 +69,20 @@ class CompactE2ETest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         lines = p.stdout.strip().splitlines()
         self.assertEqual(len(lines), 4, repr(p.stdout))
-        self.assertEqual(lines[0], "no | score | title | author | id", lines[0])
+        self.assertEqual(lines[0], "no | score | title | author | id | created_utc", lines[0])
         self.assertNotIn("r/python", lines[1], lines[1])
-        self.assertTrue(lines[1].endswith("| 1abc11"), lines[1])
+        self.assertTrue(lines[1].endswith("| 1abc11 | 2024-09-05T15:26:40Z"), lines[1])
+        self.assertTrue(lines[2].endswith("| 1abc22 | 2024-09-05T15:43:20Z"), lines[2])
         self.assertEqual(lines[3], "next t3_1abc22", lines[3])
         raw = read_fixture("listing.json")
-        # Header adds a fixed ~35 bytes; 1/4 is the small-fixture bound
-        # (live data observes ~1/20, 54KB -> 2.7KB).
+        # Keep the original 1/4 size bound for the original columns;
+        # the requested timestamp column adds exactly 14 header bytes
+        # plus 23 bytes per dated row, without changing the other fields.
+        original = "\n".join(line.rsplit(" | ", 1)[0] for line in lines[:3])
+        original += "\n" + lines[3] + "\n"
+        self.assertEqual(len(p.stdout) - len(original), 14 + 2 * 23)
         self.assertLessEqual(
-            len(p.stdout) * 4, len(raw), f"{len(p.stdout)} vs {len(raw)}"
+            len(original) * 4, len(raw), f"{len(original)} vs {len(raw)}"
         )
 
     def test_02_limit_caps_and_defaults(self):
@@ -193,20 +199,20 @@ class CompactE2ETest(unittest.TestCase):
         self.assertNotIn("[...]", p.stdout, repr(p.stdout))
         self.assertEqual(
             p.stdout.splitlines()[0],
-            "no | author | score | sub | body | id",
+            "no | author | score | sub | body | id | created_utc",
             repr(p.stdout),
         )
         self.assertTrue(
             p.stdout.splitlines()[1].startswith("1 | u/u1 | +9 | r/python | yor"),
             repr(p.stdout),
         )
-        self.assertTrue(p.stdout.splitlines()[1].endswith("| k1"), repr(p.stdout))
+        self.assertTrue(p.stdout.splitlines()[1].endswith("| k1 | -"), repr(p.stdout))
 
     def test_10_saved_mixes_post_comment_kinds(self):
         p = run({"RDT_FIXTURE": fixture("mixed.json")}, "--compact", "saved")
         ls = p.stdout.strip().splitlines()
         self.assertEqual(
-            ls[0], "kind | no | score | sub | title/body | author | id", repr(p.stdout)
+            ls[0], "kind | no | score | sub | title/body | author | id | created_utc", repr(p.stdout)
         )
         self.assertTrue(
             ls[1].startswith("P | 1 ") and ls[2].startswith("C | 2 "), repr(p.stdout)
@@ -216,17 +222,16 @@ class CompactE2ETest(unittest.TestCase):
         p = run({}, "--compact", "export", "x")
         self.assertEqual(p.returncode, 2, str(p.returncode))
         out_csv = os.path.join(self.tmp, "out.txt")
-        csv_text = (
-            "title,subreddit,author,score,num_comments,url,permalink\n"
-            "Hello world,python,ali,10,3,https://ex.com/a,/r/python/a/\n"
-        )
-        p = run({"RDT_EXPORT_CSV": csv_text}, "--compact", "export", "x", "-o", out_csv)
+        posts = [{"title": "Hello world", "subreddit": "python", "author": "ali",
+                  "score": 10, "num_comments": 3, "url": "https://ex.com/a",
+                  "permalink": "/r/python/a/", "created_utc": 1709251200}]
+        p = run({"RDT_EXPORT_JSON": json.dumps(posts)}, "--compact", "export", "x", "-o", out_csv)
         self.assertEqual(p.returncode, 0, p.stderr)
         content = Path(out_csv).read_text(encoding="utf-8")
         self.assertEqual(
             content.strip(),
-            "score | sub | title | author | url\n"
-            "+10c3 | r/python | Hello world | u/ali | https://ex.com/a",
+            "score | sub | title | author | url | created_utc\n"
+            "+10c3 | r/python | Hello world | u/ali | https://ex.com/a | 2024-03-01T00:00:00Z",
             repr(content),
         )
         self.assertEqual(p.stdout.strip(), f"saved {out_csv} (1 rows)", repr(p.stdout))
@@ -418,7 +423,7 @@ class CompactE2ETest(unittest.TestCase):
         self.assertEqual(argv, ["search", "-n", "5", "--json", "--", "-h"], repr(argv))
         self.assertEqual(
             p.stdout.splitlines()[0],
-            "no | score | sub | title | author | id",
+            "no | score | sub | title | author | id | created_utc",
             repr(p.stdout[:80]),
         )
 
@@ -427,7 +432,7 @@ class CompactE2ETest(unittest.TestCase):
         p = run({"RDT_FIXTURE": empty_env}, "--compact", "search", "x")
         self.assertEqual(p.returncode, 0, repr((p.returncode, p.stderr)))
         self.assertEqual(
-            p.stdout.strip(), "no | score | sub | title | author | id", repr(p.stdout)
+            p.stdout.strip(), "no | score | sub | title | author | id | created_utc", repr(p.stdout)
         )
 
     def test_27_null_data_node(self):
@@ -503,23 +508,23 @@ class CompactE2ETest(unittest.TestCase):
         self.assertIn("r/?", p.stdout, repr(p.stdout))
         self.assertEqual(
             len(p.stdout.splitlines()[1].split(" | ")),
-            len(["no", "score", "sub", "title", "author", "id"]),
+            len(["no", "score", "sub", "title", "author", "id", "created_utc"]),
             repr(p.stdout),
         )
 
     def test_32_export_default_cap_injects_n50(self):
         out3 = os.path.join(self.tmp, "exp3.csv")
-        csv_text2 = (
-            "title,subreddit,author,score,num_comments,url\n" "t,s,a,1,0,http://e.com\n"
-        )
-        run(
-            {"RDT_EXPORT_CSV": csv_text2, "RDT_ARGV_LOG": self.log},
+        posts = [{"title": "t", "subreddit": "s", "author": "a",
+                  "score": 1, "num_comments": 0, "url": "http://e.com"}]
+        p = run(
+            {"RDT_EXPORT_JSON": json.dumps(posts), "RDT_ARGV_LOG": self.log},
             "--compact",
             "export",
             "x",
             "-o",
             out3,
         )
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         argv = last_argv(self.log)
         self.assertIn("-n", argv, repr(argv))
         self.assertIn("50", argv, repr(argv))
@@ -538,11 +543,10 @@ class CompactE2ETest(unittest.TestCase):
 
     def test_34_export_strips_compact_and_yaml_flags(self):
         out4 = os.path.join(self.tmp, "exp4.csv")
-        csv_text2 = (
-            "title,subreddit,author,score,num_comments,url\n" "t,s,a,1,0,http://e.com\n"
-        )
-        run(
-            {"RDT_EXPORT_CSV": csv_text2, "RDT_ARGV_LOG": self.log},
+        posts = [{"title": "t", "subreddit": "s", "author": "a",
+                  "score": 1, "num_comments": 0, "url": "http://e.com"}]
+        p = run(
+            {"RDT_EXPORT_JSON": json.dumps(posts), "RDT_ARGV_LOG": self.log},
             "--compact",
             "export",
             "-c",
@@ -552,12 +556,13 @@ class CompactE2ETest(unittest.TestCase):
             "--yaml",
             "--compact",
         )
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         argv = last_argv(self.log)
         self.assertNotIn("-c", argv, repr(argv))
         self.assertNotIn("--compact", argv, repr(argv))
         self.assertNotIn("--yaml", argv, repr(argv))
         self.assertIn("--format", argv, repr(argv))
-        self.assertIn("csv", argv, repr(argv))
+        self.assertIn("json", argv, repr(argv))
 
     def test_35_count_flag_clamped(self):
         run(
@@ -629,7 +634,7 @@ class CompactE2ETest(unittest.TestCase):
             ),
         )
         p = run({"RDT_FIXTURE": null_author_comment}, "--compact", "read", "na1")
-        self.assertIn("u/? +2: null author body", p.stdout, repr(p.stdout))
+        self.assertIn("u/? +2 [-]: null author body", p.stdout, repr(p.stdout))
 
     def test_38_compact_status_single_line_no_path_leak(self):
         p = run(
@@ -686,6 +691,84 @@ class CompactE2ETest(unittest.TestCase):
         argv = last_argv(self.log)
         self.assertNotIn("--yaml", argv, repr(argv))
         self.assertIn("--json", argv, repr(argv))
+
+    def test_41_read_show_dates_in_raw_and_typed_threads(self):
+        for shape in ("raw", "typed"):
+            for cmd in ("read", "show"):
+                for tz in ("UTC0", "EST5EDT", "JST-9"):
+                    with self.subTest(shape=shape, cmd=cmd, tz=tz):
+                        post = {"id": "p", "created_utc": 1709251199}
+                        comment = {"author": "a", "body": "top", "created_utc": 1709251200}
+                        reply = {"author": "b", "body": "reply\nsecond line", "created_utc": 1709251201}
+                        if shape == "typed":
+                            comment["replies"] = [reply]
+                            data = {"post": post, "comments": [comment]}
+                        else:
+                            comment["replies"] = {"data": {"children": [{"kind": "t1", "data": reply}]}}
+                            data = [{"data": {"children": [{"data": post}]}},
+                                    {"data": {"children": [{"kind": "t1", "data": comment}]}}]
+                        path = self.write_tmp("thread.json", json.dumps({"ok": True, "data": data}))
+                        p = run({"RDT_FIXTURE": path, "TZ": tz}, "-c", cmd, "p")
+                        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                        self.assertIn(" | created_utc 2024-02-29T23:59:59Z", p.stdout)
+                        self.assertIn("u/a +0 [2024-03-01T00:00:00Z]: top", p.stdout)
+                        self.assertIn("  u/b +0 [2024-03-01T00:00:01Z]: reply\n  second line", p.stdout)
+
+    def test_42_csv_export_uses_json_and_preserves_text(self):
+        posts = [{"title": 'a,b\n"quoted"|pipe', "created_utc": 1709251199},
+                 {"title": "missing"}]
+        outfile = os.path.join(self.tmp, "dates.csv")
+        for tz in ("UTC0", "EST5EDT", "JST-9"):
+            p = run({"RDT_EXPORT_JSON": json.dumps(posts), "RDT_ARGV_LOG": self.log, "TZ": tz},
+                    "-c", "export", "query", "--format=csv", f"--output={outfile}")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(outfile, encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["title"], posts[0]["title"])
+            self.assertEqual([r["created_utc"] for r in rows], ["2024-02-29T23:59:59Z", "-"])
+            argv = last_argv(self.log)
+            self.assertIn("json", argv)
+            self.assertNotIn(outfile, argv)
+            self.assertEqual(p.stdout, f"saved {outfile} (2 rows)\n")
+
+    def test_43_export_duplicate_outputs_and_dashdash(self):
+        first = os.path.join(self.tmp, "first.txt")
+        last = os.path.join(self.tmp, "last.txt")
+        posts = [{"title": "x", "created_utc": 1709251200}]
+        p = run({"RDT_EXPORT_JSON": json.dumps(posts), "RDT_ARGV_LOG": self.log},
+                "-c", "export", "-o", first, f"-o{last}", "--", "-query")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(first))
+        self.assertIn("2024-03-01T00:00:00Z", Path(last).read_text())
+        argv = last_argv(self.log)
+        self.assertEqual(argv[-2:], ["--", "-query"])
+        self.assertEqual(argv.count("-o"), 1)
+        self.assertEqual(list(Path(self.tmp).glob(".rdt-tidy-export-*")), [])
+
+    def test_44_compact_preserves_backend_failure_and_diagnostics(self):
+        p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_EXIT": "7",
+                 "RDT_STDERR": "backend failure\n"}, "-c", "sub", "python")
+        self.assertEqual(p.returncode, 7)
+        self.assertEqual(p.stdout, "ERR backend: rdt exited with code 7\n")
+        self.assertEqual(p.stderr, "backend failure\n")
+        p = run({"RDT_FIXTURE": fixture("listing.json"), "RDT_STDERR": "warning\n"},
+                "-c", "sub", "python")
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(p.stderr, "warning\n")
+        self.assertTrue(p.stdout.startswith("no | score |"))
+
+    def test_45_listing_file_policy_is_shared_across_record_types(self):
+        for cmd, args, name in (
+            ("sub", ["python"], "listing.json"),
+            ("user-comments", ["alice"], "ucomments.json"),
+            ("saved", [], "mixed.json"), ("upvoted", [], "mixed.json"),
+        ):
+            with self.subTest(command=cmd):
+                rest = [*args, "-n", "100", "-o", os.path.join(self.tmp, "out.json"), "--yaml"]
+                p = run({"RDT_FIXTURE": fixture(name), "RDT_ARGV_LOG": self.log}, "-c", cmd, *rest)
+                self.assertEqual(p.returncode, 0)
+                self.assertEqual(last_argv(self.log), [cmd, *rest])
+                self.assertEqual(p.stdout, read_fixture(name))
 
 
 if __name__ == "__main__":

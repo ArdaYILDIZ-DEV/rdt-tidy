@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
-"""Regression tests: malformed detail envelopes must not crash the parser.
+"""Malformed detail containers, hidden-comment counts and deep reply trees.
 
-Covers two reported bugs (branch bugfix/detail-robustness):
-
-  Bug 1 -- `_absorb_raw_child` more-stub branch evaluates
-  ``child.get("data")`` twice inside one ternary, which mypy 2.3.1
-  rejects (``union-attr``: ``Any | dict | None`` has no ``.get``).
-  Runtime behavior for missing/null ``data`` (counted as one hidden
-  item) is locked in here so the cleanup cannot change it.
-
-  Bug 2 -- `_parse_raw_detail` calls ``.get("children", [])`` on
-  ``(first/second.get("data") or {})``. Any *truthy non-dict* ``data``
-  node (list, int, str, ...) raises ``AttributeError`` and kills the
-  `read`/`show` path on a malformed backend envelope. These tests are
-  red until the fix lands.
+Missing/null more-stub data counts as one hidden item. Invalid listing and
+reply containers must not crash; valid nesting is traversed iteratively.
 """
 
 import importlib.machinery
@@ -39,7 +28,7 @@ def _post_child():
 
 
 class RawDetailMalformedDataTest(unittest.TestCase):
-    """Bug 2: truthy non-dict `data` nodes must parse as empty (red pre-fix)."""
+    """Truthy non-dict listing data must parse as empty."""
 
     def test_second_data_truthy_list(self):
         post, comments, more = parse_detail(
@@ -89,8 +78,7 @@ class RawDetailNullDataTest(unittest.TestCase):
 
 
 class MoreStubDataTest(unittest.TestCase):
-    """Bug 1: more-stub counting must stay at one hidden item for
-    missing/null `data`, and nested `replies.data = None` must not crash."""
+    """Missing/null stub data counts as one; invalid reply data is empty."""
 
     def test_more_stub_data_none_counts_one(self):
         self.assertEqual(_absorb_raw_child({"kind": "more", "data": None}, []), 1)

@@ -5,6 +5,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -42,6 +43,15 @@ render_user = _mod.render_user
 render_status = _mod.render_status
 _compact_list_view = _mod._compact_list_view
 LIMIT_FLAGS = _mod.LIMIT_FLAGS
+
+
+def _json_export_backend(args):
+    """Write to the requested private stage, like the real JSON export backend."""
+    path = TokenView(args[1:]).value({"-o", "--output"})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([{"score": 1, "num_comments": 2, "subreddit": "s",
+                    "title": "t", "author": "a", "url": "u"}], f)
+    return mock.Mock(returncode=0, stdout="", stderr="")
 
 
 class TokenViewTest(unittest.TestCase):
@@ -329,9 +339,9 @@ class RenderDetailTest(unittest.TestCase):
             }
         }
         out = render_detail(env)
-        self.assertIn("u/u1 +1: line1", out)
+        self.assertIn("u/u1 +1 [-]: line1", out)
         self.assertIn("\nline2\n\nline3", out)
-        self.assertEqual(out.splitlines()[2], "u/u1 +1: line1")
+        self.assertEqual(out.splitlines()[2], "u/u1 +1 [-]: line1")
 
     def test_multiline_reply_stays_indented(self):
         # Dict-shape replies come from the nested "replies" list
@@ -358,7 +368,7 @@ class RenderDetailTest(unittest.TestCase):
             }
         }
         out = render_detail(env)
-        self.assertIn("  u/u1 +1: a1", out)
+        self.assertIn("  u/u1 +1 [-]: a1", out)
         self.assertIn("\n  a2", out)
 
 
@@ -775,9 +785,7 @@ class ExportTmpSafetyTest(unittest.TestCase):
     """A planted `{outfile}.tmp` (file or link) must not hijack the export."""
 
     def _run_export(self, out):
-        proc = mock.Mock()
-        proc.returncode = 0
-        with mock.patch.object(_mod, "run_backend", return_value=proc):
+        with mock.patch.object(_mod, "run_backend", side_effect=_json_export_backend):
             return _mod.cmd_export_compact(["-o", out])
 
     def _write_valid_csv(self, out):
@@ -797,7 +805,7 @@ class ExportTmpSafetyTest(unittest.TestCase):
             with open(out, encoding="utf-8") as f:
                 content = f.read()
             self.assertTrue(
-                content.startswith("score | sub | title | author | url\n"), content
+                content.startswith("score | sub | title | author | url | created_utc\n"), content
             )
             self.assertIn("u/a", content)
 
@@ -816,21 +824,29 @@ class ExportTmpSafetyTest(unittest.TestCase):
                 self.assertEqual(f.read(), "untouched")
 
 
-class ExportMalformedCsvTest(unittest.TestCase):
-    """Oversized backend CSV cells must be a controlled error, not a traceback."""
+class ExportMalformedJsonTest(unittest.TestCase):
+    """Oversized backend JSON must be a controlled error, not a traceback."""
 
     @mock.patch.object(_mod, "run_backend")
-    def test_oversized_cell_is_controlled_error(self, mock_run):
-        mock_run.return_value.returncode = 0
+    def test_oversized_payload_is_controlled_error(self, mock_run):
+        def backend(args):
+            path = TokenView(args[1:]).value({"-o", "--output"})
+            with open(path, "wb") as f:
+                f.write(b" " * (_mod.MAX_BACKEND_BYTES + 1))
+            return mock.Mock(returncode=0)
+
+        mock_run.side_effect = backend
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "big.csv")
-            with open(out, "w", encoding="utf-8", newline="") as f:
-                f.write("score,num_comments,subreddit,title,author,url\n")
-                f.write("1,2,s," + "t" * 200000 + ",a,u\n")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("existing")
             with contextlib.redirect_stdout(io.StringIO()) as cap:
                 rc = _mod.cmd_export_compact(["-o", out])
             self.assertEqual(rc, EX_BACKEND)
-            self.assertIn("ERR io", cap.getvalue())
+            self.assertIn("ERR backend", cap.getvalue())
+            self.assertIn("too large", cap.getvalue())
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "existing")
 
 
 class PipeEscapeTest(unittest.TestCase):
@@ -851,7 +867,7 @@ class PipeEscapeTest(unittest.TestCase):
         }
         line = _mod.post_line(1, d, True)
         self.assertIn(r"a\|b", line)
-        self.assertEqual(line.count(" | "), 5)
+        self.assertEqual(line.count(" | "), 6)
 
     def test_comment_body_pipe_escaped(self):
         line = _mod.comment_line(
@@ -932,11 +948,12 @@ class BackendTimeoutTest(unittest.TestCase):
     @mock.patch.object(_mod.subprocess, "run")
     def test_timeout_message_reports_configured_seconds(self, mock_run):
         mock_run.side_effect = _mod.subprocess.TimeoutExpired(cmd="rdt", timeout=9)
-        with mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: "9"}):
-            with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(
-                io.StringIO()
-            ) as err:
-                _mod.run_backend(["status"])
+        with (
+            mock.patch.dict(os.environ, {_mod.BACKEND_TIMEOUT_ENV: "9"}),
+            self.assertRaises(SystemExit) as ctx,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            _mod.run_backend(["status"])
         self.assertEqual(ctx.exception.code, _mod.EX_BACKEND)
         self.assertIn("within 9s", err.getvalue())
 
@@ -951,9 +968,11 @@ class EnvelopeSizeGuardTest(unittest.TestCase):
     def test_oversized_payload_is_controlled_error(self):
         big = "x" * (_mod.MAX_BACKEND_BYTES + 1)
         proc = mock.Mock(stdout=big, stderr="", returncode=0)
-        with contextlib.redirect_stdout(io.StringIO()) as cap:
-            with self.assertRaises(SystemExit) as ctx:
-                _mod.load_envelope(proc)
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as cap,
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            _mod.load_envelope(proc)
         self.assertEqual(ctx.exception.code, _mod.EX_BACKEND)
         self.assertIn("response too large", cap.getvalue())
 
@@ -999,7 +1018,7 @@ class WhitespacePolicyTest(unittest.TestCase):
 
 
 class ExportSchemaTest(unittest.TestCase):
-    """Lenient CSV parsing: missing columns default, extras are ignored."""
+    """JSON post projection: missing fields default, extras are ignored."""
 
     def test_missing_columns_default(self):
         line = _mod._export_line({})
@@ -1049,7 +1068,7 @@ class ExportModeTest(unittest.TestCase):
 
     @mock.patch.object(_mod, "run_backend")
     def test_output_is_owner_only(self, mock_run):
-        mock_run.return_value.returncode = 0
+        mock_run.side_effect = _json_export_backend
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "mode.csv")
             with open(out, "w", encoding="utf-8", newline="") as f:

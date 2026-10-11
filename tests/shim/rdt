@@ -24,18 +24,23 @@ if argv and argv[0] == "export":
     # RDT_EXPORT_SKIP=1 simulates a backend that exits 0 without writing
     # the file (stdout used / flag ignored) for the missing-file guard test.
     if os.environ.get("RDT_EXPORT_SKIP") == "1":
-        print("", end="")
         raise SystemExit(0)
     out = None
-    for i, t in enumerate(argv):
+    fmt = "csv"
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    for i, t in enumerate(options):
         base = t.split("=", 1)[0] if t.startswith("--") else t
+        value = t.split("=", 1)[1] if "=" in t and t.startswith("--") else (options[i + 1] if i + 1 < len(options) else None)
         if base in ("-o", "--output"):
-            out = t.split("=", 1)[1] if "=" in t and t.startswith("--") else (argv[i + 1] if i + 1 < len(argv) else None)
-    csv_text = os.environ.get("RDT_EXPORT_CSV", "")
+            out = value
+        elif base == "--format":
+            fmt = value
+        elif t.startswith("-o") and len(t) > 2:
+            out = t[2:].lstrip("=")
+    text = os.environ.get("RDT_EXPORT_JSON", "[]") if fmt == "json" else os.environ.get("RDT_EXPORT_CSV", "")
     if out:
         with open(out, "w", encoding="utf-8", newline="") as f:
-            f.write(csv_text)
-    print("", end="")
+            f.write(text)
     raise SystemExit(0)
 
 fix = os.environ.get("RDT_FIXTURE", "")
